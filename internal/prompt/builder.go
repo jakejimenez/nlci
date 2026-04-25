@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/jakejimenez/nlci/internal/definition"
+	"github.com/jakejimenez/nlci/internal/retrieval"
 )
 
 const (
@@ -18,34 +19,22 @@ const (
 
 // Request carries all the inputs needed to build an inference prompt.
 type Request struct {
-	Def           *definition.CLIDefinition
-	Intent        string
-	SubcommandHelp string // optional: targeted --help slice for the matched subcommand
-	ErrorContext   string // optional: injected during agentic loop retries
+	Def          *definition.CLIDefinition
+	Intent       string
+	Candidates   []retrieval.Candidate // retrieved top-K candidates; nil = show all commands
+	ErrorContext string                // optional: injected during agentic loop retries
 }
 
 // Build assembles the full inference prompt from a Request.
-// It respects the token budget and trims if necessary.
 func Build(r Request) (system string, userPrompt string) {
-	system = buildSystem(r.Def)
+	system = buildSystem(r.Def, r.Candidates)
 	userPrompt = buildUser(r)
 	return system, userPrompt
 }
 
-// BuildRouting builds a minimal routing prompt to identify the best subcommand.
-// Used by the cascading router when keyword confidence is LOW.
-func BuildRouting(subcommands []string, intent string) string {
-	return fmt.Sprintf(
-		"Subcommands: %s\nIntent: %s\nWhich single subcommand best matches this intent? Reply with one word only.",
-		strings.Join(subcommands, ", "),
-		intent,
-	)
-}
-
-func buildSystem(def *definition.CLIDefinition) string {
+func buildSystem(def *definition.CLIDefinition, candidates []retrieval.Candidate) string {
 	var b strings.Builder
 
-	// Use provided system prompt or fall back to default template
 	if def.SystemPrompt != "" {
 		b.WriteString(strings.TrimSpace(def.SystemPrompt))
 	} else {
@@ -53,7 +42,7 @@ func buildSystem(def *definition.CLIDefinition) string {
 	}
 
 	b.WriteString("\n\n")
-	b.WriteString(buildSchema(def))
+	b.WriteString(buildSchema(def, candidates))
 
 	return b.String()
 }
@@ -61,8 +50,8 @@ func buildSystem(def *definition.CLIDefinition) string {
 func buildUser(r Request) string {
 	var b strings.Builder
 
-	// Few-shot examples
-	examples := collectExamples(r.Def, MaxExamples)
+	// Few-shot examples — draw from candidates (top candidate first).
+	examples := collectCandidateExamples(r.Candidates, MaxExamples)
 	if len(examples) > 0 {
 		b.WriteString("Examples:\n")
 		for _, ex := range examples {
@@ -71,14 +60,17 @@ func buildUser(r Request) string {
 		b.WriteString("\n")
 	}
 
-	// Targeted subcommand --help slice
-	if r.SubcommandHelp != "" {
-		b.WriteString("Relevant flags:\n")
-		b.WriteString(r.SubcommandHelp)
-		b.WriteString("\n\n")
+	// Live --help for the top candidate to expose exact flag names.
+	if len(r.Candidates) > 0 && r.Def != nil {
+		helpText := definition.SubcommandHelpText(r.Def.Binary, r.Candidates[0].Command.Name)
+		if helpText != "" {
+			b.WriteString("Relevant flags:\n")
+			b.WriteString(helpText)
+			b.WriteString("\n\n")
+		}
 	}
 
-	// Error context from agentic loop
+	// Error context injected by the agentic retry loop.
 	if r.ErrorContext != "" {
 		b.WriteString(r.ErrorContext)
 		b.WriteString("\n\n")
@@ -89,27 +81,40 @@ func buildUser(r Request) string {
 	return b.String()
 }
 
-// buildSchema compresses the CLI definition into a token-efficient schema string.
-func buildSchema(def *definition.CLIDefinition) string {
+// buildSchema lists the candidate commands (or all commands when no candidates).
+// Showing only candidates focuses the model on the retrieved subcommand space and
+// cuts token usage significantly for large definitions.
+func buildSchema(def *definition.CLIDefinition, candidates []retrieval.Candidate) string {
 	var b strings.Builder
 	b.WriteString("Available commands:\n")
 
-	for _, cmd := range def.Commands {
-		if cmd.Description != "" {
-			b.WriteString(fmt.Sprintf("  %s: %s\n", cmd.Name, cmd.Description))
-		} else {
-			b.WriteString(fmt.Sprintf("  %s\n", cmd.Name))
+	if len(candidates) > 0 {
+		for _, c := range candidates {
+			if c.Command.Description != "" {
+				b.WriteString(fmt.Sprintf("  %s: %s\n", c.Command.Name, c.Command.Description))
+			} else {
+				b.WriteString(fmt.Sprintf("  %s\n", c.Command.Name))
+			}
+		}
+	} else {
+		for _, cmd := range def.Commands {
+			if cmd.Description != "" {
+				b.WriteString(fmt.Sprintf("  %s: %s\n", cmd.Name, cmd.Description))
+			} else {
+				b.WriteString(fmt.Sprintf("  %s\n", cmd.Name))
+			}
 		}
 	}
 
 	return b.String()
 }
 
-// collectExamples gathers up to n few-shot examples from across all commands.
-func collectExamples(def *definition.CLIDefinition, n int) [][2]string {
+// collectCandidateExamples gathers up to n few-shot examples, drawing from
+// candidates in rank order (top candidate's examples first).
+func collectCandidateExamples(candidates []retrieval.Candidate, n int) [][2]string {
 	var examples [][2]string
-	for _, cmd := range def.Commands {
-		for _, ex := range cmd.Examples {
+	for _, c := range candidates {
+		for _, ex := range c.Command.Examples {
 			examples = append(examples, [2]string{ex.NL, ex.Cmd})
 			if len(examples) >= n {
 				return examples

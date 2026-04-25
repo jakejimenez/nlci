@@ -18,12 +18,15 @@ type Options struct {
 
 // ExecError carries details about a failed command execution.
 // IsUsageError is true when the failure looks like a CLI flag/syntax error
-// (e.g. "unknown flag", "unknown command") rather than a runtime failure.
+// (e.g. "unknown flag", "bad flag syntax") rather than a runtime failure.
+// IsMisrouting is true when the failure indicates the wrong subcommand was
+// generated (e.g. "unknown command", "no such command").
 type ExecError struct {
-	Cmd         string
-	Err         error
-	Stderr      string
+	Cmd          string
+	Err          error
+	Stderr       string
 	IsUsageError bool
+	IsMisrouting bool
 }
 
 func (e *ExecError) Error() string {
@@ -35,19 +38,38 @@ func (e *ExecError) Error() string {
 
 func (e *ExecError) Unwrap() error { return e.Err }
 
+// misroutingPatterns are substrings matched case-insensitively against stderr
+// to detect cases where the wrong subcommand was generated.
+// On misrouting the agent widens its retrieval candidates before retrying.
+var misroutingPatterns = []string{
+	"unknown command",
+	"no such command",
+	"command not found",
+	"is not a docker command",
+	"is not a gh command",
+}
+
 // usageErrorPatterns are substrings matched case-insensitively against stderr
-// to detect CLI flag/syntax errors that are worth retrying with a new generation.
+// to detect CLI flag/syntax errors worth retrying with a corrected generation.
+// Misrouting patterns are intentionally excluded here so the caller can branch.
 var usageErrorPatterns = []string{
 	"unknown flag",
-	"unknown command",
 	"unknown shorthand flag",
 	"flag provided but not defined",
 	"invalid argument",
 	"invalid option",
-	"error: unknown",
-	"no such command",
 	"bad flag syntax",
 	"usage:",
+}
+
+func isMisrouting(stderr string) bool {
+	lower := strings.ToLower(stderr)
+	for _, p := range misroutingPatterns {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
 }
 
 func isUsageError(stderr string) bool {
@@ -107,11 +129,15 @@ func run(ctx context.Context, command string) error {
 
 	if err := cmd.Run(); err != nil {
 		stderrStr := stderrBuf.String()
+		misrouted := isMisrouting(stderrStr)
 		return &ExecError{
 			Cmd:          command,
 			Err:          err,
 			Stderr:       stderrStr,
-			IsUsageError: isUsageError(stderrStr),
+			IsMisrouting: misrouted,
+			// A misrouting failure is also a kind of usage error, but we keep
+			// the flags separate so the agent can widen candidates on misrouting.
+			IsUsageError: misrouted || isUsageError(stderrStr),
 		}
 	}
 

@@ -127,28 +127,14 @@ type commandOutput struct {
 }
 
 func (o *OpenAIBackend) Generate(ctx context.Context, r Request) (Response, error) {
-	systemContent := r.System
-	if r.Schema != "" {
-		systemContent += "\n\nAvailable commands:\n" + r.Schema
-	}
-
-	userContent := r.Intent
-	if len(r.Examples) > 0 {
-		var exLines strings.Builder
-		exLines.WriteString("Examples:\n")
-		for _, ex := range r.Examples {
-			exLines.WriteString(fmt.Sprintf("  User: %s\n  Command: %s\n", ex[0], ex[1]))
-		}
-		userContent = exLines.String() + "\nUser: " + r.Intent
-	}
-
-	// Ask for JSON output with command and explanation fields
-	userContent += "\n\nRespond with JSON: {\"command\": \"...\", \"explanation\": \"...\"}"
+	// The system prompt (r.System) already contains the schema and the user
+	// prompt (r.Intent) already contains examples — no augmentation needed here.
+	userContent := r.Intent + "\n\nRespond with JSON: {\"command\": \"...\", \"explanation\": \"...\"}"
 
 	body := chatRequest{
 		Model: o.model,
 		Messages: []chatMessage{
-			{Role: "system", Content: systemContent},
+			{Role: "system", Content: r.System},
 			{Role: "user", Content: userContent},
 		},
 		Stream:         false, // EXPLICIT: Ollama defaults to stream:true
@@ -183,34 +169,6 @@ func (o *OpenAIBackend) Generate(ctx context.Context, r Request) (Response, erro
 		Command:     strings.TrimSpace(out.Command),
 		Explanation: strings.TrimSpace(out.Explanation),
 	}, nil
-}
-
-// GenerateRaw sends a simple two-message conversation and returns raw text.
-func (o *OpenAIBackend) GenerateRaw(ctx context.Context, system, prompt string) (string, error) {
-	body := chatRequest{
-		Model: o.model,
-		Messages: []chatMessage{
-			{Role: "system", Content: system},
-			{Role: "user", Content: prompt},
-		},
-		Stream:      false,
-		Temperature: 0.1,
-	}
-
-	raw, err := o.post(ctx, "/v1/chat/completions", body)
-	if err != nil {
-		return "", err
-	}
-
-	var chatResp chatResponse
-	if err := json.Unmarshal(raw, &chatResp); err != nil {
-		return "", fmt.Errorf("%s: parse raw response: %w", o.name, err)
-	}
-	if len(chatResp.Choices) == 0 {
-		return "", fmt.Errorf("%s: empty response choices", o.name)
-	}
-
-	return chatResp.Choices[0].Message.Content, nil
 }
 
 func (o *OpenAIBackend) post(ctx context.Context, path string, body interface{}) ([]byte, error) {

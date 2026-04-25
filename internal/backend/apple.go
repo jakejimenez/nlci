@@ -58,16 +58,13 @@ func (a *AppleBackend) Ping(ctx context.Context) error {
 // Generate runs the Swift subprocess, sends the request via stdin,
 // and reads the response from stdout.
 func (a *AppleBackend) Generate(ctx context.Context, r Request) (Response, error) {
-	// Ensure Examples is never marshalled as JSON null — Swift's non-optional
-	// [[String]] decoder will throw on null even with decodeIfPresent as a safeguard.
-	examples := r.Examples
-	if examples == nil {
-		examples = make([][2]string, 0)
-	}
+	// bridgeInput keeps schema/examples fields for wire compatibility with
+	// existing nlci-apple binaries; they are intentionally empty — the system
+	// prompt already embeds the schema, and examples are part of the user prompt.
 	input := bridgeInput{
 		System:   r.System,
-		Schema:   r.Schema,
-		Examples: examples,
+		Schema:   "",
+		Examples: make([][2]string, 0),
 		Intent:   r.Intent,
 	}
 
@@ -108,18 +105,4 @@ func (a *AppleBackend) Generate(ctx context.Context, r Request) (Response, error
 		Command:     out.Command,
 		Explanation: out.Explanation,
 	}, nil
-}
-
-// GenerateRaw runs a simple single-turn prompt through the Swift binary.
-// Used for routing inference calls.
-func (a *AppleBackend) GenerateRaw(ctx context.Context, system, prompt string) (string, error) {
-	r := Request{
-		System: system,
-		Intent: prompt,
-	}
-	resp, err := a.Generate(ctx, r)
-	if err != nil {
-		return "", err
-	}
-	return resp.Command, nil
 }

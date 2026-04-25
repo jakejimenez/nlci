@@ -18,19 +18,28 @@ var bundledFS embed.FS
 //  2. User paths from config (typically ~/.config/nlci/definitions/)
 //  3. Bundled definitions embedded in the binary
 //
-// If auto_discover is true (or no YAML found), --help is also parsed and merged.
+// If a local file is found but fails to parse, Load returns an error immediately
+// (no silent fallthrough). If auto_discover is true, --help is also parsed and merged.
 func Load(toolName string, userPaths []string) (*CLIDefinition, error) {
 	filename := toolName + ".nlci.yaml"
 
-	// 1. Current directory
-	if def, err := loadFile(filename); err == nil {
+	// 1. Current directory — fail loudly if file exists but is invalid.
+	if data, err := os.ReadFile(filename); err == nil {
+		def, parseErr := parse(data)
+		if parseErr != nil {
+			return nil, fmt.Errorf("definition: error in %s: %w", filename, parseErr)
+		}
 		return enrich(def)
 	}
 
-	// 2. User-configured paths
+	// 2. User-configured paths — same: loud failure on parse error.
 	for _, dir := range userPaths {
 		path := filepath.Join(dir, filename)
-		if def, err := loadFile(path); err == nil {
+		if data, err := os.ReadFile(path); err == nil {
+			def, parseErr := parse(data)
+			if parseErr != nil {
+				return nil, fmt.Errorf("definition: error in %s: %w", path, parseErr)
+			}
 			return enrich(def)
 		}
 	}

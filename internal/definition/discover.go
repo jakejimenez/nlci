@@ -3,16 +3,19 @@ package definition
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
-	"context"
 )
 
 // Discover runs `<binary> --help` and parses the output into a list of Commands.
-// It makes a best-effort attempt to extract subcommand names and descriptions.
+// It traverses one level deep: if a top-level subcommand itself has subcommands,
+// those are emitted as full paths (e.g. "pr create") and the parent is dropped.
+// Commands that have no deeper subcommands are kept as-is (e.g. "ps").
 func Discover(binary string) ([]Command, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -35,7 +38,75 @@ func Discover(binary string) ([]Command, error) {
 		return nil, fmt.Errorf("discover: no help output from %q", binary)
 	}
 
-	return parseHelpText(helpText), nil
+	topLevel := parseHelpText(helpText)
+
+	// Expand one level deeper: replace parent with its children when nested
+	// subcommands exist. Run concurrently with a short per-command timeout.
+	type result struct {
+		cmds []Command
+	}
+	results := make([]result, len(topLevel))
+
+	var wg sync.WaitGroup
+	for i, c := range topLevel {
+		wg.Add(1)
+		go func(i int, c Command) {
+			defer wg.Done()
+			nested := discoverNested(binary, c.Name)
+			if len(nested) > 0 {
+				results[i] = result{nested}
+			} else {
+				results[i] = result{[]Command{c}}
+			}
+		}(i, c)
+	}
+	wg.Wait()
+
+	var commands []Command
+	seen := make(map[string]bool)
+	for _, r := range results {
+		for _, c := range r.cmds {
+			if !seen[c.Name] {
+				seen[c.Name] = true
+				commands = append(commands, c)
+			}
+		}
+	}
+	return commands, nil
+}
+
+// discoverNested runs `<binary> <subcommand> --help` and returns child commands
+// as full paths (e.g. "pr create" for subcommand "pr", child "create").
+// Returns nil if no nested subcommands are found.
+func discoverNested(binary, subcommand string) []Command {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	args := append(strings.Fields(subcommand), "--help")
+	cmd := exec.CommandContext(ctx, binary, args...)
+	var out, errOut bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errOut
+	_ = cmd.Run()
+
+	text := out.String()
+	if strings.TrimSpace(text) == "" {
+		text = errOut.String()
+	}
+
+	nested := parseHelpText(text)
+	if len(nested) == 0 {
+		return nil
+	}
+
+	result := make([]Command, 0, len(nested))
+	for _, n := range nested {
+		result = append(result, Command{
+			Name:        subcommand + " " + n.Name,
+			Description: n.Description,
+		})
+	}
+	return result
 }
 
 // DiscoverSubcommand runs `<binary> <subcommand> --help` and returns parsed flags.

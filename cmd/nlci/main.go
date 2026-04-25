@@ -153,9 +153,9 @@ func writeScaffold(filename, toolName string, commands []definition.Command) err
 	fmt.Fprintf(f, "\ncommands:\n")
 
 	for _, c := range commands {
-		fmt.Fprintf(f, "  - name: %s\n", c.Name)
+		fmt.Fprintf(f, "  - name: %s\n", yamlQuote(c.Name))
 		if c.Description != "" {
-			fmt.Fprintf(f, "    description: %s\n", c.Description)
+			fmt.Fprintf(f, "    description: %s\n", yamlQuote(c.Description))
 		}
 		fmt.Fprintf(f, "    examples:\n")
 		fmt.Fprintf(f, "      # - nl: \"...\"\n")
@@ -167,6 +167,23 @@ func writeScaffold(filename, toolName string, commands []definition.Command) err
 	fmt.Fprintf(f, "  forbidden: []\n")
 	fmt.Fprintf(f, "\nauto_discover: true\n")
 	return nil
+}
+
+// yamlQuote wraps s in double quotes if it contains YAML special characters.
+// Command names and descriptions from --help output can contain colons,
+// brackets, or other characters that would break bare YAML scalars.
+func yamlQuote(s string) string {
+	needsQuote := false
+	for _, special := range []string{":", "#", "&", "*", "!", "|", ">", "{", "}", "[", "]", ","} {
+		if strings.Contains(s, special) {
+			needsQuote = true
+			break
+		}
+	}
+	if needsQuote || s == "" {
+		return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
+	}
+	return s
 }
 
 // newConfigCmd shows current configuration and backend status.

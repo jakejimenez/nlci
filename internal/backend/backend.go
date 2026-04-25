@@ -10,11 +10,11 @@ import (
 var ErrBackendUnavailable = errors.New("backend unavailable")
 
 // Request is the input to an inference call.
+// The System field contains the fully-assembled system prompt (including schema
+// and examples). Backends should not augment it further.
 type Request struct {
-	System   string      `json:"system"`
-	Schema   string      `json:"schema"`
-	Examples [][2]string `json:"examples"`
-	Intent   string      `json:"intent"`
+	System string `json:"system"`
+	Intent string `json:"intent"`
 }
 
 // Response is the output from an inference call.
@@ -32,7 +32,4 @@ type Backend interface {
 	Ping(ctx context.Context) error
 	// Generate runs inference and returns the generated command.
 	Generate(ctx context.Context, r Request) (Response, error)
-	// GenerateRaw runs a simple system+prompt inference call, returning raw text.
-	// Used by the routing inference step.
-	GenerateRaw(ctx context.Context, system, prompt string) (string, error)
 }

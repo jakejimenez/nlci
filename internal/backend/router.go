@@ -91,23 +91,6 @@ func (r *Router) Generate(ctx context.Context, req Request) (Response, error) {
 	return resp, nil
 }
 
-// GenerateRaw resolves the active backend and runs a raw inference call.
-// If the backend returns an unavailable error, the active cache is cleared.
-func (r *Router) GenerateRaw(ctx context.Context, system, prompt string) (string, error) {
-	b, err := r.Resolve(ctx)
-	if err != nil {
-		return "", err
-	}
-	raw, err := b.GenerateRaw(ctx, system, prompt)
-	if err != nil {
-		if errors.Is(err, ErrBackendUnavailable) {
-			r.active = nil
-		}
-		return "", err
-	}
-	return raw, nil
-}
-
 // ActiveName returns the name of the currently active backend, or empty string.
 func (r *Router) ActiveName() string {
 	if r.active != nil {

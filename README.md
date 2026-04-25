@@ -59,10 +59,10 @@ nlci sits between you and any CLI tool. You describe what you want in plain Engl
 Your intent
     │
     ▼
-Cascading router    keyword match → synonym dict → routing inference
+Retrieval index     lexical top-K match against command names, descriptions, examples
     │
     ▼
-Prompt builder      system prompt + schema + few-shot examples + intent
+Prompt builder      system prompt + candidate schema + few-shot examples + live --help + intent
     │
     ▼
 Inference backend   Apple Intelligence → Ollama → llama.cpp → LM Studio
@@ -74,7 +74,7 @@ Validator           schema conformance + safety rules
 Executor            confirm (if needed) → run → stream output
     │
     ▼ on error
-Agentic loop        inject --help + error context → retry (max 3×)
+Agentic loop        inject error context → retry (max 3×); widen candidates on misrouting
 ```
 
 All inference runs on-device. No data leaves your machine.
@@ -214,13 +214,13 @@ nlci/
 │   └── Sources/NLCIApple/   @Generable CommandResult, App.swift entry point
 ├── cmd/nlci/                Cobra CLI: run, init, config
 ├── internal/
-│   ├── definition/          YAML loader + --help auto-discovery
+│   ├── definition/          YAML loader + --help auto-discovery (one level deep)
+│   ├── retrieval/           Lexical top-K retrieval index (no model call)
 │   ├── prompt/              Prompt builder + 3,500-token budget enforcer
-│   ├── router/              Keyword → synonym → routing inference cascade
 │   ├── backend/             Apple subprocess + OpenAI-compat (Ollama/llama.cpp/LM Studio)
 │   ├── validator/           Schema conformance + safety rules
 │   ├── executor/            Confirm prompt + subprocess execution
-│   └── agent/               One-shot + agentic retry loop (max 3×)
+│   └── agent/               Retrieve → infer → validate → execute loop (max 3×)
 ├── config/                  ~/.config/nlci/config.yaml
 ├── definitions/             docker.nlci.yaml, gh.nlci.yaml
 └── nlci.go                  Public SDK surface
@@ -230,7 +230,7 @@ The Swift binary (`nlci-apple`) is a subprocess invoked per-request. It reads a 
 
 ## Token budget
 
-Apple Intelligence has a 4,096-token context window. A typical nlci request uses ~955 tokens, leaving ~3,141 tokens of headroom. For large CLI schemas, the prompt builder pre-filters commands by keyword relevance before sending.
+Apple Intelligence has a 4,096-token context window. nlci keeps within a 3,500-token safe ceiling. The retrieval step sends only the top-K matched commands to the prompt builder (not the full schema), which keeps typical requests well under budget even for large CLI definitions.
 
 ## Verification
 
