@@ -53,6 +53,7 @@ func Load(toolName string, userPaths []string) (*CLIDefinition, error) {
 	def := &CLIDefinition{
 		Name:         toolName,
 		Binary:       toolName,
+		Mode:         "command_tree",
 		AutoDiscover: true,
 	}
 	return enrich(def)
@@ -90,6 +91,9 @@ func parse(data []byte) (*CLIDefinition, error) {
 	}
 	if def.Binary == "" {
 		def.Binary = def.Name
+	}
+	if def.Mode == "" {
+		def.Mode = "command_tree"
 	}
 	return &def, nil
 }

@@ -6,85 +6,407 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 )
 
-// Discover runs `<binary> --help` and parses the output into a list of Commands.
-// It traverses one level deep: if a top-level subcommand itself has subcommands,
-// those are emitted as full paths (e.g. "pr create") and the parent is dropped.
-// Commands that have no deeper subcommands are kept as-is (e.g. "ps").
+const (
+	defaultDiscoveryDepth       = 2
+	defaultDiscoveryConcurrency = 6
+	defaultRootHelpTimeout      = 5 * time.Second
+	defaultProbeTimeout         = 2 * time.Second
+)
+
+var (
+	commandSectionRe = regexp.MustCompile(`(?i)^((available|additional|management|basic|other)\s+)?(commands?|subcommands?):?\s*$`)
+	commandLineRe    = regexp.MustCompile(`^\s{1,8}([a-z0-9][a-z0-9_-]*)(?:,\s*-[A-Za-z])?(?:\s{2,}(.+))?$`)
+	flagRe           = regexp.MustCompile(`^\s+(-([a-zA-Z]),\s+)?--([a-zA-Z][a-zA-Z0-9_-]*)(?:\s+\S+)?\s{2,}(.*)$`)
+	commandPartRe    = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
+
+	invalidHelpMarkers = []string{
+		"unknown command",
+		"unknown subcommand",
+		"unknown shorthand flag",
+		"unknown option",
+		"unknown flag",
+		"no such command",
+		"unrecognized command",
+		"invalid choice",
+		"did you mean",
+	}
+
+	placeholderParts = map[string]bool{
+		"arg": true, "args": true, "argument": true, "arguments": true,
+		"cask": true, "command": true, "commands": true, "file": true,
+		"files": true, "formula": true, "formulae": true, "name": true,
+		"option": true, "options": true, "path": true, "regex": true,
+		"repo": true, "subcommand": true, "subcommands": true,
+		"text": true, "url": true, "value": true, "values": true,
+	}
+
+	skippedCommandNames = map[string]bool{
+		"help":    true,
+		"version": true,
+	}
+)
+
+// DiscoveryOptions controls how aggressively deterministic discovery traverses a CLI.
+type DiscoveryOptions struct {
+	MaxDepth       int
+	MaxConcurrency int
+	RootTimeout    time.Duration
+	ProbeTimeout   time.Duration
+}
+
+// DiscoveryMetrics summarizes deterministic discovery coverage.
+type DiscoveryMetrics struct {
+	VerifiedCommands         int
+	CommandsWithDescriptions int
+	NestedCommands           int
+	ProbedCommands           int
+	QualityScore             float64
+}
+
+// DiscoveryResult is the full output of deterministic CLI discovery.
+type DiscoveryResult struct {
+	Commands []Command
+	RootHelp string
+	Metrics  DiscoveryMetrics
+}
+
+// DiscoveryQuality is the discovery quality gate used by init.
+type DiscoveryQuality struct {
+	Score float64
+	Weak  bool
+}
+
+type probeTarget struct {
+	Command Command
+	Depth   int
+}
+
+type probeResult struct {
+	Verified bool
+	Command  Command
+	Children []Command
+}
+
+// DefaultDiscoveryOptions returns bounded traversal defaults suitable for init
+// and runtime auto-discovery.
+func DefaultDiscoveryOptions() DiscoveryOptions {
+	return DiscoveryOptions{
+		MaxDepth:       defaultDiscoveryDepth,
+		MaxConcurrency: defaultDiscoveryConcurrency,
+		RootTimeout:    defaultRootHelpTimeout,
+		ProbeTimeout:   defaultProbeTimeout,
+	}
+}
+
+// Discover runs deterministic CLI discovery and returns the final command set.
 func Discover(binary string) ([]Command, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	result, err := DiscoverDetailed(binary)
+	if err != nil {
+		return nil, err
+	}
+	return result.Commands, nil
+}
 
-	cmd := exec.CommandContext(ctx, binary, "--help")
-	var out bytes.Buffer
-	var errOut bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &errOut
+// DiscoverDetailed returns the full deterministic discovery result.
+func DiscoverDetailed(binary string) (*DiscoveryResult, error) {
+	return DiscoverWithOptions(binary, DefaultDiscoveryOptions())
+}
 
-	// Many CLIs write help to stderr and exit non-zero — that's fine
-	_ = cmd.Run()
+// DiscoverWithOptions runs deterministic discovery with explicit traversal limits.
+func DiscoverWithOptions(binary string, opts DiscoveryOptions) (*DiscoveryResult, error) {
+	opts = normalizeDiscoveryOptions(opts)
 
-	helpText := out.String()
-	if strings.TrimSpace(helpText) == "" {
-		helpText = errOut.String()
+	rootHelp, err := probeRootHelp(binary, opts.RootTimeout)
+	if err != nil {
+		return nil, err
 	}
 
-	if strings.TrimSpace(helpText) == "" {
-		return nil, fmt.Errorf("discover: no help output from %q", binary)
+	result := &DiscoveryResult{RootHelp: compressHelpText(rootHelp)}
+
+	initial := parseDiscoveryText(binary, "", rootHelp)
+	inventory := discoverInventory(binary, opts.ProbeTimeout)
+	initial = mergeCommands(initial, inventory)
+
+	commands, metrics := traverseCommandTree(binary, initial, opts)
+	result.Commands = commands
+	result.Metrics = metrics
+	quality := AssessDiscoveryQuality(result)
+	result.Metrics.QualityScore = quality.Score
+
+	return result, nil
+}
+
+// DiscoverFromSeeds verifies and expands a set of candidate command paths.
+// It is used by init's inference-assisted fallback so the model can suggest
+// likely paths while the CLI remains the source of truth.
+func DiscoverFromSeeds(binary string, seeds []Command, opts DiscoveryOptions) (*DiscoveryResult, error) {
+	opts = normalizeDiscoveryOptions(opts)
+	commands, metrics := traverseCommandTree(binary, seeds, opts)
+	result := &DiscoveryResult{Commands: commands, Metrics: metrics}
+	quality := AssessDiscoveryQuality(result)
+	result.Metrics.QualityScore = quality.Score
+	return result, nil
+}
+
+// AssessDiscoveryQuality scores deterministic discovery so init can decide
+// whether inference-assisted probing is worth attempting.
+func AssessDiscoveryQuality(result *DiscoveryResult) DiscoveryQuality {
+	if result == nil {
+		return DiscoveryQuality{Score: 0, Weak: true}
+	}
+	total := len(result.Commands)
+	if total == 0 {
+		return DiscoveryQuality{Score: 0, Weak: true}
 	}
 
-	topLevel := parseHelpText(helpText)
-
-	// Expand one level deeper: replace parent with its children when nested
-	// subcommands exist. Run concurrently with a short per-command timeout.
-	type result struct {
-		cmds []Command
-	}
-	results := make([]result, len(topLevel))
-
-	var wg sync.WaitGroup
-	for i, c := range topLevel {
-		wg.Add(1)
-		go func(i int, c Command) {
-			defer wg.Done()
-			nested := discoverNested(binary, c.Name)
-			if len(nested) > 0 {
-				results[i] = result{nested}
-			} else {
-				results[i] = result{[]Command{c}}
-			}
-		}(i, c)
-	}
-	wg.Wait()
-
-	var commands []Command
-	seen := make(map[string]bool)
-	for _, r := range results {
-		for _, c := range r.cmds {
-			if !seen[c.Name] {
-				seen[c.Name] = true
-				commands = append(commands, c)
+	described := result.Metrics.CommandsWithDescriptions
+	if described == 0 {
+		for _, c := range result.Commands {
+			if strings.TrimSpace(c.Description) != "" {
+				described++
 			}
 		}
 	}
-	return commands, nil
+
+	nested := result.Metrics.NestedCommands
+	if nested == 0 {
+		for _, c := range result.Commands {
+			if strings.Contains(c.Name, " ") {
+				nested++
+			}
+		}
+	}
+
+	descRatio := float64(described) / float64(total)
+	nestedRatio := float64(nested) / float64(total)
+
+	score := float64(total)*4 + descRatio*25 + nestedRatio*10
+	if score > 100 {
+		score = 100
+	}
+
+	weak := total == 0 || (total < 6 && descRatio < 0.6)
+	return DiscoveryQuality{Score: score, Weak: weak}
 }
 
-// discoverNested runs `<binary> <subcommand> --help` and returns child commands
-// as full paths (e.g. "pr create" for subcommand "pr", child "create").
-// Returns nil if no nested subcommands are found.
-func discoverNested(binary, subcommand string) []Command {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+func normalizeDiscoveryOptions(opts DiscoveryOptions) DiscoveryOptions {
+	if opts.MaxDepth <= 0 {
+		opts.MaxDepth = defaultDiscoveryDepth
+	}
+	if opts.MaxConcurrency <= 0 {
+		opts.MaxConcurrency = defaultDiscoveryConcurrency
+	}
+	if opts.RootTimeout <= 0 {
+		opts.RootTimeout = defaultRootHelpTimeout
+	}
+	if opts.ProbeTimeout <= 0 {
+		opts.ProbeTimeout = defaultProbeTimeout
+	}
+	return opts
+}
+
+func probeRootHelp(binary string, timeout time.Duration) (string, error) {
+	text, err := runFirstSuccessful(binary, timeout, [][]string{{"--help"}, {"help"}})
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(text) == "" {
+		return "", fmt.Errorf("discover: no help output from %q", binary)
+	}
+	return text, nil
+}
+
+func discoverInventory(binary string, timeout time.Duration) []Command {
+	var commands []Command
+	for _, args := range []struct {
+		argv    []string
+		useList bool
+	}{
+		{argv: []string{"commands", "--quiet"}, useList: true},
+		{argv: []string{"commands"}, useList: true},
+		{argv: []string{"help", "commands"}},
+	} {
+		text, err := runCLI(binary, args.argv, timeout)
+		if err != nil || strings.TrimSpace(text) == "" || isInvalidHelpOutput(text) {
+			continue
+		}
+		if args.useList {
+			commands = mergeCommands(commands, parseCommandList("", text))
+		}
+		commands = mergeCommands(commands, parseDiscoveryText(binary, "", text))
+	}
+	return commands
+}
+
+func traverseCommandTree(binary string, initial []Command, opts DiscoveryOptions) ([]Command, DiscoveryMetrics) {
+	current := make([]probeTarget, 0, len(initial))
+	queued := make(map[string]bool, len(initial))
+	for _, c := range initial {
+		if c.Name == "" || queued[c.Name] {
+			continue
+		}
+		queued[c.Name] = true
+		current = append(current, probeTarget{Command: c, Depth: 1})
+	}
+
+	verified := make(map[string]Command, len(initial))
+	hasChildren := make(map[string]bool, len(initial))
+	var order []string
+	metrics := DiscoveryMetrics{}
+
+	for len(current) > 0 {
+		results := probeLevel(binary, current, opts)
+		var next []probeTarget
+		for _, r := range results {
+			if !r.Verified {
+				continue
+			}
+			metrics.ProbedCommands++
+
+			existing, seen := verified[r.Command.Name]
+			if seen {
+				verified[r.Command.Name] = mergeCommand(existing, r.Command)
+			} else {
+				verified[r.Command.Name] = r.Command
+				order = append(order, r.Command.Name)
+			}
+
+			if len(r.Children) > 0 {
+				hasChildren[r.Command.Name] = true
+			}
+
+			for _, child := range r.Children {
+				if queued[child.Name] || child.Name == r.Command.Name {
+					continue
+				}
+				queued[child.Name] = true
+				next = append(next, probeTarget{Command: child, Depth: depthOf(child.Name)})
+			}
+		}
+
+		current = nil
+		for _, candidate := range next {
+			if candidate.Depth <= opts.MaxDepth {
+				current = append(current, candidate)
+			}
+		}
+	}
+
+	commands := make([]Command, 0, len(order))
+	for _, name := range order {
+		if hasChildren[name] {
+			continue
+		}
+		cmd := verified[name]
+		commands = append(commands, cmd)
+		if strings.TrimSpace(cmd.Description) != "" {
+			metrics.CommandsWithDescriptions++
+		}
+		if strings.Contains(cmd.Name, " ") {
+			metrics.NestedCommands++
+		}
+	}
+	metrics.VerifiedCommands = len(commands)
+	return commands, metrics
+}
+
+func probeLevel(binary string, current []probeTarget, opts DiscoveryOptions) []probeResult {
+	results := make([]probeResult, len(current))
+	sem := make(chan struct{}, opts.MaxConcurrency)
+	var wg sync.WaitGroup
+
+	for i, target := range current {
+		wg.Add(1)
+		go func(i int, target probeTarget) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			results[i] = probePath(binary, target.Command, opts.ProbeTimeout)
+		}(i, target)
+	}
+
+	wg.Wait()
+	return results
+}
+
+func probePath(binary string, target Command, timeout time.Duration) probeResult {
+	helpText, err := probeCommandHelp(binary, target.Name, timeout)
+	if err != nil || strings.TrimSpace(helpText) == "" || isInvalidHelpOutput(helpText) {
+		return probeResult{}
+	}
+
+	verified := target
+	if verified.Description == "" {
+		verified.Description = extractHelpSummary(helpText)
+	}
+	verified.Flags = parseFlags(helpText)
+
+	children := parseDiscoveryText(binary, target.Name, helpText)
+	filteredChildren := make([]Command, 0, len(children))
+	for _, child := range children {
+		if child.Name != target.Name {
+			filteredChildren = append(filteredChildren, child)
+		}
+	}
+
+	return probeResult{
+		Verified: true,
+		Command:  verified,
+		Children: filteredChildren,
+	}
+}
+
+func probeCommandHelp(binary, path string, timeout time.Duration) (string, error) {
+	pathArgs := strings.Fields(path)
+	candidates := []string{strings.Join(append(pathArgs, "--help"), " ")}
+	if len(pathArgs) > 0 {
+		candidates = append(candidates, strings.Join(append([]string{"help"}, pathArgs...), " "))
+	}
+
+	text, err := runFirstSuccessful(binary, timeout, [][]string{append(pathArgs, "--help"), append([]string{"help"}, pathArgs...)})
+	if err != nil {
+		return "", fmt.Errorf("discover: probe %q: %w", path, err)
+	}
+	if strings.TrimSpace(text) == "" {
+		return "", fmt.Errorf("discover: empty help for %q (tried %s)", path, strings.Join(candidates, ", "))
+	}
+	return text, nil
+}
+
+func runFirstSuccessful(binary string, timeout time.Duration, argSets [][]string) (string, error) {
+	var lastErr error
+	for _, args := range argSets {
+		if len(args) == 0 {
+			continue
+		}
+		text, err := runCLI(binary, args, timeout)
+		if err == nil && strings.TrimSpace(text) != "" && !isInvalidHelpOutput(text) {
+			return text, nil
+		}
+		if err != nil {
+			lastErr = err
+		}
+	}
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("discover: no output from %q", binary)
+}
+
+func runCLI(binary string, args []string, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	args := append(strings.Fields(subcommand), "--help")
 	cmd := exec.CommandContext(ctx, binary, args...)
-	var out, errOut bytes.Buffer
+	var out bytes.Buffer
+	var errOut bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errOut
 	_ = cmd.Run()
@@ -93,104 +415,42 @@ func discoverNested(binary, subcommand string) []Command {
 	if strings.TrimSpace(text) == "" {
 		text = errOut.String()
 	}
-
-	nested := parseHelpText(text)
-	if len(nested) == 0 {
-		return nil
-	}
-
-	result := make([]Command, 0, len(nested))
-	for _, n := range nested {
-		result = append(result, Command{
-			Name:        subcommand + " " + n.Name,
-			Description: n.Description,
-		})
-	}
-	return result
-}
-
-// DiscoverSubcommand runs `<binary> <subcommand> --help` and returns parsed flags.
-func DiscoverSubcommand(binary, subcommand string) ([]Flag, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	args := append(strings.Fields(subcommand), "--help")
-	cmd := exec.CommandContext(ctx, binary, args...)
-	var out bytes.Buffer
-	var errOut bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &errOut
-
-	_ = cmd.Run()
-
-	helpText := out.String()
-	if strings.TrimSpace(helpText) == "" {
-		helpText = errOut.String()
-	}
-
-	return parseFlags(helpText), nil
-}
-
-// SubcommandHelpText returns the raw --help output for a subcommand.
-// Used by the agentic loop to inject into retry prompts.
-func SubcommandHelpText(binary, subcommand string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	args := append(strings.Fields(subcommand), "--help")
-	cmd := exec.CommandContext(ctx, binary, args...)
-	var out bytes.Buffer
-	var errOut bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &errOut
-
-	_ = cmd.Run()
-
-	text := out.String()
 	if strings.TrimSpace(text) == "" {
-		text = errOut.String()
+		return "", fmt.Errorf("discover: no output from %q %s", binary, strings.Join(args, " "))
 	}
-
-	return compressHelpText(text)
+	return text, nil
 }
 
-// parseHelpText extracts subcommands from --help output.
-// Handles multiple common CLI help formats (cobra, urfave/cli, custom).
-func parseHelpText(text string) []Command {
+func parseDiscoveryText(binary, prefix, text string) []Command {
+	binary = filepath.Base(binary)
+	commands := parseSectionCommands(prefix, text)
+	commands = mergeCommands(commands, parseUsageCommands(binary, prefix, text))
+	commands = mergeCommands(commands, parseCommandList(prefix, text))
+	return commands
+}
+
+func parseSectionCommands(prefix, text string) []Command {
 	var commands []Command
 	seen := make(map[string]bool)
-
 	scanner := bufio.NewScanner(strings.NewReader(text))
-
-	// State machine: look for a "Commands:" or "Available Commands:" section
-	inCommandsSection := false
-	commandSectionRe := regexp.MustCompile(`(?i)^(available\s+)?commands?:?\s*$`)
-	// Match lines like:  "  subcommand   Description of subcommand"
-	commandLineRe := regexp.MustCompile(`^\s{1,6}([a-z][a-z0-9_-]*)(?:\s{2,}(.+))?$`)
+	inSection := false
 
 	for scanner.Scan() {
 		line := scanner.Text()
-
-		// Detect section headers
 		trimmed := strings.TrimSpace(line)
+
 		if commandSectionRe.MatchString(trimmed) {
-			inCommandsSection = true
+			inSection = true
 			continue
 		}
-
-		// A blank line or new section header ends the commands section
-		if inCommandsSection {
-			if trimmed == "" {
-				continue
-			}
-			// New section (non-indented header)
-			if !strings.HasPrefix(line, " ") && strings.HasSuffix(trimmed, ":") {
-				inCommandsSection = false
-				continue
-			}
+		if !inSection {
+			continue
 		}
-
-		if !inCommandsSection {
+		if trimmed == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, " ") && strings.HasSuffix(trimmed, ":") {
+			inSection = false
 			continue
 		}
 
@@ -199,41 +459,315 @@ func parseHelpText(text string) []Command {
 			continue
 		}
 
-		name := matches[1]
+		name, ok := joinCommandPath(prefix, matches[1])
+		if !ok || skippedCommandNames[name] || seen[name] {
+			continue
+		}
+		seen[name] = true
+
 		desc := ""
 		if len(matches) > 2 {
 			desc = strings.TrimSpace(matches[2])
 		}
-
-		// Skip common non-command words
-		skip := map[string]bool{
-			"help": true, "version": true, "completion": true,
-			"help,": true, "options": true, "flags": true,
-		}
-		if skip[name] || seen[name] {
-			continue
-		}
-
-		seen[name] = true
-		commands = append(commands, Command{
-			Name:        name,
-			Description: desc,
-		})
+		commands = append(commands, Command{Name: name, Description: desc})
 	}
 
 	return commands
+}
+
+func parseUsageCommands(binary, prefix, text string) []Command {
+	var commands []Command
+	seen := make(map[string]bool)
+
+	scanner := bufio.NewScanner(strings.NewReader(text))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		line = trimUsagePrefix(line)
+		line = trimStructuredPrefixes(line)
+		tail, ok := stripBinaryPrefix(line, binary)
+		if !ok {
+			continue
+		}
+		if prefix != "" {
+			tail, ok = stripPrefixPath(tail, prefix)
+			if !ok {
+				continue
+			}
+		}
+
+		name, ok := parseCommandPathFromTail(prefix, tail)
+		if !ok || seen[name] || skippedCommandNames[name] {
+			continue
+		}
+		seen[name] = true
+		commands = append(commands, Command{Name: name})
+	}
+
+	return commands
+}
+
+func parseCommandList(prefix, text string) []Command {
+	var lines []string
+	scanner := bufio.NewScanner(strings.NewReader(text))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	if len(lines) < 3 {
+		return nil
+	}
+
+	commandish := 0
+	for _, line := range lines {
+		if strings.Contains(line, " ") || strings.Contains(line, "\t") {
+			continue
+		}
+		if _, ok := normalizePathPart(line); ok || strings.HasPrefix(line, "--") {
+			commandish++
+		}
+	}
+	if commandish*3 < len(lines)*2 {
+		return nil
+	}
+
+	var commands []Command
+	seen := make(map[string]bool)
+	for _, line := range lines {
+		if strings.Contains(line, " ") || strings.Contains(line, "\t") {
+			continue
+		}
+		name, ok := joinCommandPath(prefix, line)
+		if !ok || seen[name] || skippedCommandNames[name] {
+			continue
+		}
+		seen[name] = true
+		commands = append(commands, Command{Name: name})
+	}
+	return commands
+}
+
+func mergeCommands(base []Command, additions ...[]Command) []Command {
+	result := append([]Command(nil), base...)
+	index := make(map[string]int, len(result))
+	for i, cmd := range result {
+		index[cmd.Name] = i
+	}
+
+	for _, set := range additions {
+		for _, cmd := range set {
+			if cmd.Name == "" {
+				continue
+			}
+			if i, ok := index[cmd.Name]; ok {
+				result[i] = mergeCommand(result[i], cmd)
+				continue
+			}
+			index[cmd.Name] = len(result)
+			result = append(result, cmd)
+		}
+	}
+
+	return result
+}
+
+func mergeCommand(a, b Command) Command {
+	merged := a
+	if merged.Name == "" {
+		merged.Name = b.Name
+	}
+	if merged.Description == "" {
+		merged.Description = b.Description
+	}
+	if len(merged.Flags) == 0 {
+		merged.Flags = append([]Flag(nil), b.Flags...)
+	}
+	return merged
+}
+
+func joinCommandPath(prefix, raw string) (string, bool) {
+	part, ok := normalizePathPart(raw)
+	if !ok {
+		return "", false
+	}
+	if prefix == "" {
+		return part, true
+	}
+	return prefix + " " + part, true
+}
+
+func stripBinaryPrefix(line, binary string) (string, bool) {
+	if line == binary {
+		return "", true
+	}
+	if strings.HasPrefix(line, binary+" ") {
+		return strings.TrimSpace(strings.TrimPrefix(line, binary)), true
+	}
+	return "", false
+}
+
+func stripPrefixPath(tail, prefix string) (string, bool) {
+	prefixParts := strings.Fields(prefix)
+	tailParts := strings.Fields(tail)
+	if len(tailParts) < len(prefixParts) {
+		return "", false
+	}
+	matchedAliasToken := false
+	for i, want := range prefixParts {
+		raw := tailParts[i]
+		part, ok := normalizePathPart(tailParts[i])
+		if !ok || part != want {
+			return "", false
+		}
+		if i == len(prefixParts)-1 && strings.HasSuffix(raw, ",") {
+			matchedAliasToken = true
+		}
+	}
+	if matchedAliasToken {
+		return "", true
+	}
+	return strings.Join(tailParts[len(prefixParts):], " "), true
+}
+
+func parseCommandPathFromTail(prefix, tail string) (string, bool) {
+	fields := strings.Fields(tail)
+	var parts []string
+	for _, field := range fields {
+		part, ok := normalizePathPart(field)
+		if !ok {
+			if len(parts) == 0 {
+				return "", false
+			}
+			break
+		}
+		parts = append(parts, part)
+		// Usage lines like "brew doctor, dr [options]" expose aliases inline.
+		// Keep the canonical path segment and stop before alias tokens.
+		if strings.HasSuffix(field, ",") {
+			break
+		}
+	}
+	if len(parts) == 0 {
+		return "", false
+	}
+	name := strings.Join(parts, " ")
+	if prefix != "" {
+		name = prefix + " " + name
+	}
+	if skippedCommandNames[name] {
+		return "", false
+	}
+	return name, true
+}
+
+func normalizePathPart(token string) (string, bool) {
+	token = strings.TrimSpace(token)
+	token = strings.Trim(token, `"'`)
+	token = strings.TrimRight(token, ":,")
+	if token == "" {
+		return "", false
+	}
+
+	if strings.HasPrefix(token, "[") && strings.HasSuffix(token, "]") && !strings.Contains(token, " ") {
+		inner := strings.ToLower(strings.Trim(token, "[]"))
+		if inner == "" || placeholderParts[inner] {
+			return "", false
+		}
+		token = inner
+	}
+
+	if strings.HasPrefix(token, "-") || strings.ContainsAny(token, `/|<>(){}=`) {
+		return "", false
+	}
+	if placeholderParts[strings.ToLower(token)] {
+		return "", false
+	}
+	if !commandPartRe.MatchString(token) {
+		return "", false
+	}
+	return token, true
+}
+
+func trimUsagePrefix(line string) string {
+	lower := strings.ToLower(line)
+	if strings.HasPrefix(lower, "usage:") {
+		return strings.TrimSpace(line[len("usage:"):])
+	}
+	return line
+}
+
+func trimStructuredPrefixes(line string) string {
+	for strings.HasPrefix(line, "[") {
+		end := strings.Index(line, "]")
+		if end <= 0 {
+			break
+		}
+		line = strings.TrimSpace(line[end+1:])
+	}
+	return line
+}
+
+func depthOf(path string) int {
+	if strings.TrimSpace(path) == "" {
+		return 0
+	}
+	return len(strings.Fields(path))
+}
+
+func extractHelpSummary(text string) string {
+	scanner := bufio.NewScanner(strings.NewReader(text))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "usage:") || strings.HasSuffix(line, ":") {
+			continue
+		}
+		return line
+	}
+	return ""
+}
+
+func isInvalidHelpOutput(text string) bool {
+	lower := strings.ToLower(text)
+	for _, marker := range invalidHelpMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// DiscoverSubcommand runs `<binary> <subcommand> --help` and returns parsed flags.
+func DiscoverSubcommand(binary, subcommand string) ([]Flag, error) {
+	helpText, err := probeCommandHelp(binary, subcommand, defaultRootHelpTimeout)
+	if err != nil {
+		return nil, err
+	}
+	return parseFlags(helpText), nil
+}
+
+// SubcommandHelpText returns the raw --help output for a subcommand.
+// Used by the agentic loop to inject into retry prompts.
+func SubcommandHelpText(binary, subcommand string) string {
+	helpText, err := probeCommandHelp(binary, subcommand, defaultRootHelpTimeout)
+	if err != nil {
+		return ""
+	}
+	return compressHelpText(helpText)
 }
 
 // parseFlags extracts flag information from subcommand --help output.
 func parseFlags(text string) []Flag {
 	var flags []Flag
 	seen := make(map[string]bool)
-
-	// Match patterns like:
-	//   -f, --flag         Description
-	//       --flag         Description
-	//   -f string          Description
-	flagRe := regexp.MustCompile(`^\s+(-([a-zA-Z]),\s+)?--([a-zA-Z][a-zA-Z0-9_-]*)(?:\s+\S+)?\s{2,}(.*)$`)
 
 	scanner := bufio.NewScanner(strings.NewReader(text))
 	for scanner.Scan() {
@@ -246,7 +780,6 @@ func parseFlags(text string) []Flag {
 		short := matches[2]
 		name := matches[3]
 		desc := strings.TrimSpace(matches[4])
-
 		if seen[name] {
 			continue
 		}
@@ -281,7 +814,6 @@ func FormatFlags(flags []Flag) string {
 		lines = append(lines, line)
 	}
 	result := strings.Join(lines, "\n")
-	// Cap at ~600 chars to stay comfortably within the token budget.
 	if len(result) > 600 {
 		result = result[:600] + "\n  [...]"
 	}
@@ -299,7 +831,6 @@ func compressHelpText(text string) string {
 		if trimmed == "" {
 			continue
 		}
-		// Keep flag lines and section headers; skip example/usage blocks
 		if strings.HasPrefix(trimmed, "-") ||
 			strings.HasPrefix(trimmed, "--") ||
 			strings.HasSuffix(trimmed, ":") ||
@@ -309,7 +840,6 @@ func compressHelpText(text string) string {
 	}
 
 	result := strings.Join(lines, "\n")
-	// Hard cap at ~800 chars to stay within token budget
 	if len(result) > 800 {
 		result = result[:800] + "\n[...truncated]"
 	}

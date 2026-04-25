@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"regexp"
+	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/jakejimenez/nlci/config"
@@ -19,6 +22,7 @@ var (
 	flagDryRun  bool
 	flagExplain bool
 	flagBackend string
+	initSeedPartRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 )
 
 func main() {
@@ -104,18 +108,13 @@ func newInitCmd() *cobra.Command {
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runInit(args[0])
+			return runInit(cmd.Context(), args[0])
 		},
 	}
 }
 
-func runInit(toolName string) error {
+func runInit(ctx context.Context, toolName string) error {
 	fmt.Printf("Discovering %s --help...\n", toolName)
-
-	commands, err := definition.Discover(toolName)
-	if err != nil {
-		return fmt.Errorf("init: could not discover %q: %w", toolName, err)
-	}
 
 	filename := toolName + ".nlci.yaml"
 
@@ -124,17 +123,196 @@ func runInit(toolName string) error {
 		return fmt.Errorf("init: %s already exists — delete it first to re-scaffold", filename)
 	}
 
-	if err := writeScaffold(filename, toolName, commands); err != nil {
+	result, err := definition.DiscoverDetailed(toolName)
+	if err != nil {
+		return fmt.Errorf("init: could not discover %q: %w", toolName, err)
+	}
+
+	mode := "command_tree"
+	quality := definition.AssessDiscoveryQuality(result)
+	inferredCount := 0
+	if quality.Weak {
+		if flagResult, flagErr := definition.DiscoverFlagDriven(toolName); flagErr == nil && !flagResult.Weak {
+			mode = "flag_driven"
+			if err := writeFlagDrivenScaffold(filename, toolName, flagResult); err != nil {
+				return err
+			}
+			fmt.Printf("Created %s with %d verified root flags across %d capabilities.\n", filename, len(flagResult.RootFlags), len(flagResult.Capabilities))
+			fmt.Printf("  Discovery mode: %s\n", mode)
+			fmt.Printf("  Discovery quality: %.1f/100\n", flagResult.QualityScore)
+			fmt.Println()
+			fmt.Println("Next steps:")
+			fmt.Printf("  1. Add draft examples to capabilities in %s\n", filename)
+			fmt.Printf("  2. Write a system_prompt describing the tool\n")
+			fmt.Printf("  3. Run: nlci %s \"<your intent>\" --dry-run\n", toolName)
+			return nil
+		}
+
+		cfg, cfgErr := config.Load()
+		if cfgErr == nil {
+			fmt.Println("Deterministic discovery is weak; trying inference-assisted probing...")
+			inferCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			if enriched, count, inferErr := enrichInitDiscovery(inferCtx, cfg, toolName, result); inferErr == nil {
+				result = enriched
+				inferredCount = count
+				quality = definition.AssessDiscoveryQuality(result)
+			} else {
+				fmt.Printf("Inference-assisted probing skipped: %v\n", inferErr)
+			}
+			cancel()
+		}
+	}
+
+	if err := writeScaffold(filename, toolName, result.Commands); err != nil {
 		return err
 	}
 
-	fmt.Printf("Created %s with %d discovered commands.\n", filename, len(commands))
+	fmt.Printf("Created %s with %d verified commands.\n", filename, len(result.Commands))
+	if inferredCount > 0 {
+		fmt.Printf("  Inference-assisted probing verified %d additional commands.\n", inferredCount)
+	}
+	fmt.Printf("  Discovery mode: %s\n", mode)
+	fmt.Printf("  Discovery quality: %.1f/100\n", quality.Score)
 	fmt.Println()
 	fmt.Println("Next steps:")
 	fmt.Printf("  1. Add examples to each command in %s\n", filename)
 	fmt.Printf("  2. Write a system_prompt describing the tool\n")
 	fmt.Printf("  3. Run: nlci %s \"<your intent>\" --dry-run\n", toolName)
 	return nil
+}
+
+func enrichInitDiscovery(ctx context.Context, cfg config.Config, toolName string, base *definition.DiscoveryResult) (*definition.DiscoveryResult, int, error) {
+	if base == nil {
+		base = &definition.DiscoveryResult{}
+	}
+
+	br := buildBackendRouter(cfg, flagBackend)
+	seedPrompt := buildInitInferencePrompt(toolName, base)
+	resp, err := br.Generate(ctx, backend.Request{
+		System: initInferenceSystemPrompt(toolName),
+		Intent: seedPrompt,
+	})
+	if err != nil {
+		return base, 0, err
+	}
+
+	seedNames := parseInitSeedList(resp.Command)
+	if len(seedNames) == 0 {
+		return base, 0, fmt.Errorf("inference returned no candidate command paths")
+	}
+
+	seeds := make([]definition.Command, 0, len(seedNames))
+	for _, name := range seedNames {
+		seeds = append(seeds, definition.Command{Name: name})
+	}
+
+	enriched, err := definition.DiscoverFromSeeds(toolName, seeds, definition.DefaultDiscoveryOptions())
+	if err != nil {
+		return base, 0, err
+	}
+
+	before := len(base.Commands)
+	merged := &definition.DiscoveryResult{
+		Commands: definitionCommandsMerge(base.Commands, enriched.Commands),
+		RootHelp: base.RootHelp,
+		Metrics:  enriched.Metrics,
+	}
+	if merged.RootHelp == "" {
+		merged.RootHelp = enriched.RootHelp
+	}
+	quality := definition.AssessDiscoveryQuality(merged)
+	merged.Metrics.QualityScore = quality.Score
+	return merged, len(merged.Commands) - before, nil
+}
+
+func buildInitInferencePrompt(toolName string, base *definition.DiscoveryResult) string {
+	var b strings.Builder
+	b.WriteString("Root help summary:\n")
+	b.WriteString(base.RootHelp)
+	b.WriteString("\n\nAlready verified commands:\n")
+	if len(base.Commands) == 0 {
+		b.WriteString("  (none)\n")
+	} else {
+		for _, c := range base.Commands {
+			if c.Description != "" {
+				b.WriteString(fmt.Sprintf("  %s: %s\n", c.Name, c.Description))
+			} else {
+				b.WriteString(fmt.Sprintf("  %s\n", c.Name))
+			}
+		}
+	}
+	b.WriteString("\nReturn the most likely real command paths for ")
+	b.WriteString(toolName)
+	b.WriteString(" that should be probed next. One path per line, lowercase, no explanations.")
+	return b.String()
+}
+
+func initInferenceSystemPrompt(toolName string) string {
+	return strings.TrimSpace(fmt.Sprintf(`You are helping discover the command surface of the %s CLI.
+Return ONLY newline-separated command paths to probe next.
+Rules:
+- Output raw command paths only, one per line
+- Do not include the binary name %q
+- Prefer common real subcommands and nested paths
+- Never invent placeholders, examples, or explanations
+- Suggest at most 20 paths`, toolName, toolName))
+}
+
+func parseInitSeedList(raw string) []string {
+	seen := make(map[string]bool)
+	var result []string
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		line = strings.Trim(line, "`\"")
+		line = strings.TrimPrefix(line, "-")
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.Fields(strings.ToLower(line))
+		if len(parts) == 0 {
+			continue
+		}
+		ok := true
+		for _, part := range parts {
+			if !initSeedPartRe.MatchString(part) {
+				ok = false
+				break
+			}
+		}
+		if !ok {
+			continue
+		}
+		line = strings.Join(parts, " ")
+		if !seen[line] {
+			seen[line] = true
+			result = append(result, line)
+		}
+	}
+	sort.Strings(result)
+	return result
+}
+
+func definitionCommandsMerge(base, additions []definition.Command) []definition.Command {
+	result := append([]definition.Command(nil), base...)
+	index := make(map[string]int, len(result))
+	for i, cmd := range result {
+		index[cmd.Name] = i
+	}
+	for _, cmd := range additions {
+		if i, ok := index[cmd.Name]; ok {
+			if result[i].Description == "" {
+				result[i].Description = cmd.Description
+			}
+			if len(result[i].Flags) == 0 {
+				result[i].Flags = append([]definition.Flag(nil), cmd.Flags...)
+			}
+			continue
+		}
+		index[cmd.Name] = len(result)
+		result = append(result, cmd)
+	}
+	return result
 }
 
 func writeScaffold(filename, toolName string, commands []definition.Command) error {
@@ -147,6 +325,7 @@ func writeScaffold(filename, toolName string, commands []definition.Command) err
 	fmt.Fprintf(f, "name: %s\n", toolName)
 	fmt.Fprintf(f, "description: %s CLI\n", toolName)
 	fmt.Fprintf(f, "binary: %s\n", toolName)
+	fmt.Fprintf(f, "mode: command_tree\n")
 	fmt.Fprintf(f, "\nsystem_prompt: |\n")
 	fmt.Fprintf(f, "  You are an expert %s user. Generate precise %s commands.\n", toolName, toolName)
 	fmt.Fprintf(f, "  Output only the raw command — no markdown, no explanation.\n")
@@ -165,7 +344,63 @@ func writeScaffold(filename, toolName string, commands []definition.Command) err
 	fmt.Fprintf(f, "safety:\n")
 	fmt.Fprintf(f, "  require_confirmation: []\n")
 	fmt.Fprintf(f, "  forbidden: []\n")
-	fmt.Fprintf(f, "\nauto_discover: true\n")
+	// init already writes a verified command inventory, so keep runtime loading
+	// fast by default. Users can opt back into live discovery manually.
+	fmt.Fprintf(f, "\nauto_discover: false\n")
+	return nil
+}
+
+func writeFlagDrivenScaffold(filename, toolName string, result *definition.FlagDiscoveryResult) error {
+	f, err := os.Create(filename)
+	if err != nil {
+		return fmt.Errorf("init: create %s: %w", filename, err)
+	}
+	defer f.Close()
+
+	fmt.Fprintf(f, "name: %s\n", toolName)
+	fmt.Fprintf(f, "description: %s CLI\n", toolName)
+	fmt.Fprintf(f, "binary: %s\n", toolName)
+	fmt.Fprintf(f, "mode: flag_driven\n")
+	fmt.Fprintf(f, "\nsystem_prompt: |\n")
+	fmt.Fprintf(f, "  You are an expert %s user. Generate precise %s commands.\n", toolName, toolName)
+	fmt.Fprintf(f, "  This tool is flag-driven: build commands from flags and positional arguments, not subcommands.\n")
+	fmt.Fprintf(f, "  Output only the raw command — no markdown, no explanation.\n")
+
+	fmt.Fprintf(f, "\nroot_flags:\n")
+	for _, flag := range result.RootFlags {
+		fmt.Fprintf(f, "  - name: %s\n", yamlQuote(flag.Name))
+		if flag.Short != "" {
+			fmt.Fprintf(f, "    short: %s\n", yamlQuote(flag.Short))
+		}
+		if flag.ValueHint != "" {
+			fmt.Fprintf(f, "    value_hint: %s\n", yamlQuote(flag.ValueHint))
+		}
+		if flag.Description != "" {
+			fmt.Fprintf(f, "    description: %s\n", yamlQuote(flag.Description))
+		}
+	}
+
+	fmt.Fprintf(f, "\ncapabilities:\n")
+	for _, cap := range result.Capabilities {
+		fmt.Fprintf(f, "  - name: %s\n", yamlQuote(cap.Name))
+		if cap.Description != "" {
+			fmt.Fprintf(f, "    description: %s\n", yamlQuote(cap.Description))
+		}
+		if len(cap.Flags) > 0 {
+			fmt.Fprintf(f, "    flags:\n")
+			for _, flagName := range cap.Flags {
+				fmt.Fprintf(f, "      - %s\n", yamlQuote(flagName))
+			}
+		}
+		fmt.Fprintf(f, "    examples:\n")
+		fmt.Fprintf(f, "      # - nl: \"...\"\n")
+		fmt.Fprintf(f, "      #   cmd: \"%s ...\"\n", toolName)
+	}
+
+	fmt.Fprintf(f, "\nsafety:\n")
+	fmt.Fprintf(f, "  require_confirmation: []\n")
+	fmt.Fprintf(f, "  forbidden: []\n")
+	fmt.Fprintf(f, "\nauto_discover: false\n")
 	return nil
 }
 

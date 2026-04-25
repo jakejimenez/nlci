@@ -87,6 +87,10 @@ func buildUser(r Request) string {
 // Showing only candidates focuses the model on the retrieved subcommand space and
 // cuts token usage significantly for large definitions.
 func buildSchema(def *definition.CLIDefinition, candidates []retrieval.Candidate) string {
+	if def.Mode == "flag_driven" {
+		return buildFlagDrivenSchema(def, candidates)
+	}
+
 	var b strings.Builder
 	b.WriteString("Available commands:\n")
 
@@ -111,16 +115,80 @@ func buildSchema(def *definition.CLIDefinition, candidates []retrieval.Candidate
 	return b.String()
 }
 
+func buildFlagDrivenSchema(def *definition.CLIDefinition, candidates []retrieval.Candidate) string {
+	var b strings.Builder
+	b.WriteString("This CLI is flag-driven: compose commands from root flags and positional arguments, not subcommands.\n")
+	b.WriteString("Available capabilities:\n")
+
+	capSeen := make(map[string]bool)
+	if len(candidates) > 0 {
+		for _, c := range candidates {
+			if c.Capability.Name == "" || capSeen[c.Capability.Name] {
+				continue
+			}
+			capSeen[c.Capability.Name] = true
+			if c.Capability.Description != "" {
+				b.WriteString(fmt.Sprintf("  %s: %s\n", c.Capability.Name, c.Capability.Description))
+			} else {
+				b.WriteString(fmt.Sprintf("  %s\n", c.Capability.Name))
+			}
+			for _, flagName := range c.Capability.Flags {
+				if f := findRootFlag(def.RootFlags, flagName); f != nil {
+					b.WriteString(fmt.Sprintf("    --%s", f.Name))
+					if f.Short != "" {
+						b.WriteString(fmt.Sprintf(" (-%s)", f.Short))
+					}
+					if f.Description != "" {
+						b.WriteString(fmt.Sprintf(": %s", f.Description))
+					}
+					b.WriteString("\n")
+				}
+			}
+		}
+	} else {
+		for _, cap := range def.Capabilities {
+			if cap.Description != "" {
+				b.WriteString(fmt.Sprintf("  %s: %s\n", cap.Name, cap.Description))
+			} else {
+				b.WriteString(fmt.Sprintf("  %s\n", cap.Name))
+			}
+		}
+	}
+
+	b.WriteString("\nCommon root flags:\n")
+	rootFlagCount := 0
+	for _, f := range def.RootFlags {
+		b.WriteString(fmt.Sprintf("  --%s", f.Name))
+		if f.Short != "" {
+			b.WriteString(fmt.Sprintf(" (-%s)", f.Short))
+		}
+		if f.Description != "" {
+			b.WriteString(fmt.Sprintf(": %s", f.Description))
+		}
+		b.WriteString("\n")
+		rootFlagCount++
+		if rootFlagCount >= 20 {
+			break
+		}
+	}
+
+	return b.String()
+}
+
 // collectCandidateExamples gathers up to n few-shot examples, drawing from
 // candidates in rank order. Within each candidate the best-matching example
 // (as determined by retrieval scoring) is placed first.
 func collectCandidateExamples(candidates []retrieval.Candidate, n int) [][2]string {
 	var examples [][2]string
 	for _, c := range candidates {
-		if len(c.Command.Examples) == 0 {
+		exampleSet := c.Command.Examples
+		if c.Capability.Name != "" {
+			exampleSet = c.Capability.Examples
+		}
+		if len(exampleSet) == 0 {
 			continue
 		}
-		for _, ex := range orderedExamples(c.Command.Examples, c.BestExampleIdx) {
+		for _, ex := range orderedExamples(exampleSet, c.BestExampleIdx) {
 			examples = append(examples, [2]string{ex.NL, ex.Cmd})
 			if len(examples) >= n {
 				return examples
@@ -128,6 +196,15 @@ func collectCandidateExamples(candidates []retrieval.Candidate, n int) [][2]stri
 		}
 	}
 	return examples
+}
+
+func findRootFlag(flags []definition.Flag, name string) *definition.Flag {
+	for i := range flags {
+		if flags[i].Name == name {
+			return &flags[i]
+		}
+	}
+	return nil
 }
 
 // orderedExamples returns the examples slice with bestIdx moved to position 0.

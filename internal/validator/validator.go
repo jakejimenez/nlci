@@ -68,7 +68,15 @@ func Validate(command string, def *definition.CLIDefinition) Result {
 		}
 	}
 
-	// 4. Check whether this command requires confirmation before execution.
+	// 4. For flag-driven CLIs, reject obvious unknown flags against the discovered
+	//    root flag surface. Positionals and values remain free-form.
+	if def.Mode == "flag_driven" {
+		if badFlag := findUnknownFlag(command, def.RootFlags); badFlag != "" {
+			return Result{Error: fmt.Sprintf("command contains unknown flag %q", badFlag)}
+		}
+	}
+
+	// 5. Check whether this command requires confirmation before execution.
 	requiresConfirm := false
 	for _, pattern := range def.Safety.RequireConfirmation {
 		if containsAtBoundary(command, pattern) {
@@ -92,6 +100,62 @@ func findPlaceholder(command string) string {
 		}
 	}
 	return ""
+}
+
+func findUnknownFlag(command string, flags []definition.Flag) string {
+	if len(flags) == 0 {
+		return ""
+	}
+	knownLong := make(map[string]struct{}, len(flags))
+	knownShort := make(map[string]struct{}, len(flags))
+	shortNeedsValue := make(map[string]bool, len(flags))
+	for _, f := range flags {
+		knownLong["--"+f.Name] = struct{}{}
+		if f.Short != "" {
+			key := "-" + f.Short
+			knownShort[key] = struct{}{}
+			shortNeedsValue[key] = f.ValueHint != ""
+		}
+	}
+	for _, field := range strings.Fields(command) {
+		if !strings.HasPrefix(field, "-") || field == "--" {
+			continue
+		}
+		base := field
+		if i := strings.Index(base, "="); i >= 0 {
+			base = base[:i]
+		}
+		if strings.HasPrefix(base, "--") {
+			if _, ok := knownLong[base]; !ok {
+				return base
+			}
+			continue
+		}
+		if _, ok := knownShort[base]; ok {
+			continue
+		}
+		if !isValidShortFlagCluster(base, knownShort, shortNeedsValue) {
+			return base
+		}
+	}
+	return ""
+}
+
+func isValidShortFlagCluster(field string, knownShort map[string]struct{}, shortNeedsValue map[string]bool) bool {
+	if len(field) < 3 || !strings.HasPrefix(field, "-") || strings.HasPrefix(field, "--") {
+		return false
+	}
+	for i := 1; i < len(field); i++ {
+		key := "-" + string(field[i])
+		if _, ok := knownShort[key]; !ok {
+			return false
+		}
+		if shortNeedsValue[key] {
+			// Allow attached values like -oout.txt or -XPOST.
+			return true
+		}
+	}
+	return true
 }
 
 // containsAtBoundary reports whether command contains pattern such that the
