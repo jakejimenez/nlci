@@ -19,6 +19,10 @@ var placeholderREs = []*regexp.Regexp{
 	regexp.MustCompile(`\byour-\S+`),
 	// ALL-CAPS/ALL-CAPS owner/repo style (e.g. OWNER/REPO, USER/REPO)
 	regexp.MustCompile(`\b[A-Z]{2,}/[A-Z]{2,}\b`),
+	// ALL-CAPS-HYPHEN tokens (e.g. PR-BRANCH, MY-REPO, YOUR-TAG)
+	// Must be ≥2 caps segments separated by hyphens, all uppercase.
+	// Excludes single ALL-CAPS words that could be env vars or legitimate names.
+	regexp.MustCompile(`\b[A-Z]{2,}(-[A-Z]{2,})+\b`),
 	// Square-bracket tokens: [name], [value]
 	regexp.MustCompile(`\[[^\]]+\]`),
 }

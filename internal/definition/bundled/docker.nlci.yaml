@@ -16,14 +16,18 @@ commands:
   - name: ps
     description: List containers
     examples:
+      - nl: "list all running containers"
+        cmd: "docker ps"
       - nl: "show me running containers"
         cmd: "docker ps"
+      - nl: "show all containers including stopped ones"
+        cmd: "docker ps -a"
       - nl: "list all containers including stopped"
         cmd: "docker ps -a"
+      - nl: "list running containers with json format"
+        cmd: "docker ps --format json"
       - nl: "show containers with their disk sizes"
         cmd: "docker ps -s"
-      - nl: "list only running containers with sizes"
-        cmd: "docker ps -s --filter status=running"
 
   - name: run
     description: Run a container
@@ -72,18 +76,24 @@ commands:
   - name: exec
     description: Run a command in a running container
     examples:
+      - nl: "run bash in the running web container"
+        cmd: "docker exec -it web bash"
       - nl: "open a shell in the web container"
         cmd: "docker exec -it web /bin/sh"
       - nl: "enter the postgres container"
         cmd: "docker exec -it postgres bash"
+      - nl: "run a command inside a container"
+        cmd: "docker exec -it mycontainer bash"
 
   - name: logs
     description: Fetch logs from a container
     examples:
-      - nl: "show logs for the web container"
-        cmd: "docker logs web"
+      - nl: "stream logs for the nginx container"
+        cmd: "docker logs -f nginx"
       - nl: "follow logs for nginx"
         cmd: "docker logs -f nginx"
+      - nl: "show logs for the web container"
+        cmd: "docker logs web"
       - nl: "show last 50 lines of logs for api"
         cmd: "docker logs --tail 50 api"
 
@@ -142,6 +152,9 @@ synonyms:
   cleanup: ["system prune"]
   enter: ["exec"]
   shell: ["exec"]
+  bash: ["exec"]
+  stream: ["logs"]
+  follow: ["logs"]
   watch: ["stats", "events"]
   monitor: ["stats"]
   tail: ["logs"]

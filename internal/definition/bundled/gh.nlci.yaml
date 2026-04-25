@@ -21,6 +21,10 @@ commands:
   - name: "pr create"
     description: Create a pull request
     examples:
+      - nl: "create a pull request titled \"fix: login bug\" against main"
+        cmd: "gh pr create --title \"fix: login bug\" --base main"
+      - nl: "create a PR with a specific title"
+        cmd: "gh pr create --title \"My title\" --base main"
       - nl: "create a pull request"
         cmd: "gh pr create"
       - nl: "open a PR with a title and body filled from commits"
@@ -141,12 +145,14 @@ commands:
   - name: "issue list"
     description: List issues in the current repository
     examples:
+      - nl: "view my open issues assigned to me"
+        cmd: "gh issue list --assignee @me"
+      - nl: "list issues assigned to me"
+        cmd: "gh issue list --assignee @me"
       - nl: "list open issues"
         cmd: "gh issue list"
       - nl: "show all issues including closed"
         cmd: "gh issue list --state all"
-      - nl: "list issues assigned to me"
-        cmd: "gh issue list --assignee @me"
       - nl: "show bug issues"
         cmd: "gh issue list --label bug"
       - nl: "list the last 20 issues"
@@ -331,6 +337,8 @@ commands:
   - name: "browse"
     description: Open the repository in the browser
     examples:
+      - nl: "open the repo in the browser"
+        cmd: "gh browse"
       - nl: "open this repo in the browser"
         cmd: "gh browse"
       - nl: "open the issues page in the browser"
@@ -357,6 +365,8 @@ synonyms:
   show: ["list", "view", "status"]
   see: ["list", "view"]
   my: ["pr list", "issue list", "status"]
+  assigned: ["issue list", "pr list"]
+  issues: ["issue list", "issue create", "issue view"]
   failing: ["run list"]
   ci: ["run list", "pr checks", "run view"]
   checks: ["pr checks", "run list"]
