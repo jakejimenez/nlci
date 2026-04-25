@@ -1,0 +1,150 @@
+name: docker
+description: Docker container and image management
+binary: docker
+
+system_prompt: |
+  You are an expert Docker administrator and CLI user.
+  Your job is to translate natural language intent into exact docker commands.
+
+  Rules:
+  - Output ONLY the raw command — no markdown, no backticks, no explanation text
+  - The command MUST start with "docker"
+  - Use the most minimal flags that satisfy the intent
+  - If the intent is ambiguous, choose the safest interpretation
+
+commands:
+  - name: ps
+    description: List containers
+    examples:
+      - nl: "show me running containers"
+        cmd: "docker ps"
+      - nl: "list all containers including stopped"
+        cmd: "docker ps -a"
+      - nl: "show containers with their disk sizes"
+        cmd: "docker ps -s"
+      - nl: "show containers using more than 500MB"
+        cmd: "docker ps -s --filter status=running"
+
+  - name: run
+    description: Run a container
+    examples:
+      - nl: "run nginx on port 80"
+        cmd: "docker run -d -p 80:80 nginx"
+      - nl: "start a postgres container"
+        cmd: "docker run -d --name postgres -e POSTGRES_PASSWORD=password postgres"
+
+  - name: stop
+    description: Stop a running container
+    examples:
+      - nl: "stop the nginx container"
+        cmd: "docker stop nginx"
+
+  - name: rm
+    description: Remove one or more containers
+    examples:
+      - nl: "remove the stopped nginx container"
+        cmd: "docker rm nginx"
+      - nl: "force remove all stopped containers"
+        cmd: "docker rm $(docker ps -aq -f status=exited)"
+
+  - name: images
+    description: List images
+    examples:
+      - nl: "show all docker images"
+        cmd: "docker images"
+      - nl: "list images for nginx"
+        cmd: "docker images nginx"
+
+  - name: pull
+    description: Pull an image from a registry
+    examples:
+      - nl: "pull the latest nginx image"
+        cmd: "docker pull nginx:latest"
+
+  - name: build
+    description: Build an image from a Dockerfile
+    examples:
+      - nl: "build an image from the current directory"
+        cmd: "docker build -t myapp ."
+      - nl: "build with tag myapp version 1.0"
+        cmd: "docker build -t myapp:1.0 ."
+
+  - name: exec
+    description: Run a command in a running container
+    examples:
+      - nl: "open a shell in the web container"
+        cmd: "docker exec -it web /bin/sh"
+      - nl: "enter the postgres container"
+        cmd: "docker exec -it postgres bash"
+
+  - name: logs
+    description: Fetch logs from a container
+    examples:
+      - nl: "show logs for the web container"
+        cmd: "docker logs web"
+      - nl: "follow logs for nginx"
+        cmd: "docker logs -f nginx"
+      - nl: "show last 50 lines of logs for api"
+        cmd: "docker logs --tail 50 api"
+
+  - name: inspect
+    description: Return detailed information on a container or image
+    examples:
+      - nl: "inspect the web container"
+        cmd: "docker inspect web"
+
+  - name: stats
+    description: Display a live stream of container resource usage
+    examples:
+      - nl: "show resource usage for all containers"
+        cmd: "docker stats"
+      - nl: "check cpu and memory for web container"
+        cmd: "docker stats web"
+
+  - name: "system prune"
+    description: Remove unused data (stopped containers, unused images, networks)
+    examples:
+      - nl: "clean up unused images and stopped containers"
+        cmd: "docker system prune"
+      - nl: "free up disk space from docker"
+        cmd: "docker system prune"
+
+  - name: network
+    description: Manage networks
+    examples:
+      - nl: "list all docker networks"
+        cmd: "docker network ls"
+      - nl: "create a new network called mynet"
+        cmd: "docker network create mynet"
+
+  - name: volume
+    description: Manage volumes
+    examples:
+      - nl: "list all volumes"
+        cmd: "docker volume ls"
+      - nl: "create a volume called mydata"
+        cmd: "docker volume create mydata"
+
+safety:
+  require_confirmation:
+    - "docker rm"
+    - "docker stop"
+    - "docker kill"
+    - "docker system prune"
+    - "docker rmi"
+
+  forbidden:
+    - "docker system prune --force"
+    - "docker swarm leave --force"
+
+synonyms:
+  clean: ["system prune", "rm"]
+  cleanup: ["system prune"]
+  enter: ["exec"]
+  shell: ["exec"]
+  watch: ["stats", "events"]
+  monitor: ["stats"]
+  tail: ["logs"]
+  inside: ["exec"]
+
+auto_discover: true
