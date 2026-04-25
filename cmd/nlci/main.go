@@ -133,16 +133,17 @@ func runInit(ctx context.Context, toolName string) error {
 	inferredCount := 0
 	if quality.Weak {
 		if flagResult, flagErr := definition.DiscoverFlagDriven(toolName); flagErr == nil && !flagResult.Weak {
+			enrichedFlagResult, synonyms := definition.EnrichFlagDrivenScaffold(toolName, flagResult)
 			mode = "flag_driven"
-			if err := writeFlagDrivenScaffold(filename, toolName, flagResult); err != nil {
+			if err := writeFlagDrivenScaffold(filename, toolName, enrichedFlagResult, synonyms); err != nil {
 				return err
 			}
-			fmt.Printf("Created %s with %d verified root flags across %d capabilities.\n", filename, len(flagResult.RootFlags), len(flagResult.Capabilities))
+			fmt.Printf("Created %s with %d verified root flags across %d capabilities.\n", filename, len(enrichedFlagResult.RootFlags), len(enrichedFlagResult.Capabilities))
 			fmt.Printf("  Discovery mode: %s\n", mode)
-			fmt.Printf("  Discovery quality: %.1f/100\n", flagResult.QualityScore)
+			fmt.Printf("  Discovery quality: %.1f/100\n", enrichedFlagResult.QualityScore)
 			fmt.Println()
 			fmt.Println("Next steps:")
-			fmt.Printf("  1. Add draft examples to capabilities in %s\n", filename)
+			fmt.Printf("  1. Review the generated examples and synonyms in %s\n", filename)
 			fmt.Printf("  2. Write a system_prompt describing the tool\n")
 			fmt.Printf("  3. Run: nlci %s \"<your intent>\" --dry-run\n", toolName)
 			return nil
@@ -163,7 +164,10 @@ func runInit(ctx context.Context, toolName string) error {
 		}
 	}
 
-	if err := writeScaffold(filename, toolName, result.Commands); err != nil {
+	enrichedCommands, generatedSynonyms := definition.EnrichCommandTreeScaffold(toolName, result.Commands)
+	result.Commands = enrichedCommands
+
+	if err := writeScaffold(filename, toolName, result.Commands, generatedSynonyms); err != nil {
 		return err
 	}
 
@@ -175,7 +179,7 @@ func runInit(ctx context.Context, toolName string) error {
 	fmt.Printf("  Discovery quality: %.1f/100\n", quality.Score)
 	fmt.Println()
 	fmt.Println("Next steps:")
-	fmt.Printf("  1. Add examples to each command in %s\n", filename)
+	fmt.Printf("  1. Review the generated examples and synonyms in %s\n", filename)
 	fmt.Printf("  2. Write a system_prompt describing the tool\n")
 	fmt.Printf("  3. Run: nlci %s \"<your intent>\" --dry-run\n", toolName)
 	return nil
@@ -315,7 +319,7 @@ func definitionCommandsMerge(base, additions []definition.Command) []definition.
 	return result
 }
 
-func writeScaffold(filename, toolName string, commands []definition.Command) error {
+func writeScaffold(filename, toolName string, commands []definition.Command, synonyms map[string][]string) error {
 	f, err := os.Create(filename)
 	if err != nil {
 		return fmt.Errorf("init: create %s: %w", filename, err)
@@ -337,20 +341,23 @@ func writeScaffold(filename, toolName string, commands []definition.Command) err
 			fmt.Fprintf(f, "    description: %s\n", yamlQuote(c.Description))
 		}
 		fmt.Fprintf(f, "    examples:\n")
-		fmt.Fprintf(f, "      # - nl: \"...\"\n")
-		fmt.Fprintf(f, "      #   cmd: \"%s %s ...\"\n\n", toolName, c.Name)
+		writeExamples(f, "      ", c.Examples, fmt.Sprintf("%s %s ...", toolName, c.Name))
+		fmt.Fprintln(f)
 	}
 
 	fmt.Fprintf(f, "safety:\n")
 	fmt.Fprintf(f, "  require_confirmation: []\n")
 	fmt.Fprintf(f, "  forbidden: []\n")
+	if len(synonyms) > 0 {
+		writeSynonyms(f, synonyms)
+	}
 	// init already writes a verified command inventory, so keep runtime loading
 	// fast by default. Users can opt back into live discovery manually.
 	fmt.Fprintf(f, "\nauto_discover: false\n")
 	return nil
 }
 
-func writeFlagDrivenScaffold(filename, toolName string, result *definition.FlagDiscoveryResult) error {
+func writeFlagDrivenScaffold(filename, toolName string, result *definition.FlagDiscoveryResult, synonyms map[string][]string) error {
 	f, err := os.Create(filename)
 	if err != nil {
 		return fmt.Errorf("init: create %s: %w", filename, err)
@@ -393,15 +400,44 @@ func writeFlagDrivenScaffold(filename, toolName string, result *definition.FlagD
 			}
 		}
 		fmt.Fprintf(f, "    examples:\n")
-		fmt.Fprintf(f, "      # - nl: \"...\"\n")
-		fmt.Fprintf(f, "      #   cmd: \"%s ...\"\n", toolName)
+		writeExamples(f, "      ", cap.Examples, fmt.Sprintf("%s ...", toolName))
 	}
 
 	fmt.Fprintf(f, "\nsafety:\n")
 	fmt.Fprintf(f, "  require_confirmation: []\n")
 	fmt.Fprintf(f, "  forbidden: []\n")
+	if len(synonyms) > 0 {
+		writeSynonyms(f, synonyms)
+	}
 	fmt.Fprintf(f, "\nauto_discover: false\n")
 	return nil
+}
+
+func writeSynonyms(f *os.File, synonyms map[string][]string) {
+	keys := make([]string, 0, len(synonyms))
+	for key := range synonyms {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	fmt.Fprintf(f, "\nsynonyms:\n")
+	for _, key := range keys {
+		fmt.Fprintf(f, "  %s:\n", yamlQuote(key))
+		for _, target := range synonyms[key] {
+			fmt.Fprintf(f, "    - %s\n", yamlQuote(target))
+		}
+	}
+}
+
+func writeExamples(f *os.File, indent string, examples []definition.Example, fallbackCmd string) {
+	if len(examples) == 0 {
+		fmt.Fprintf(f, "%s# - nl: \"...\"\n", indent)
+		fmt.Fprintf(f, "%s#   cmd: %s\n", indent, yamlQuote(fallbackCmd))
+		return
+	}
+	for _, ex := range examples {
+		fmt.Fprintf(f, "%s- nl: %s\n", indent, yamlQuote(ex.NL))
+		fmt.Fprintf(f, "%s  cmd: %s\n", indent, yamlQuote(ex.Cmd))
+	}
 }
 
 // yamlQuote wraps s in double quotes if it contains YAML special characters.

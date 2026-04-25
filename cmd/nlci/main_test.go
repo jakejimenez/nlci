@@ -30,7 +30,7 @@ func TestWriteFlagDrivenScaffold(t *testing.T) {
 		RootFlags: []definition.Flag{{Name: "json", Description: "HTTP POST JSON"}},
 		Capabilities: []definition.Capability{{Name: "request", Description: "Control request body", Flags: []string{"json"}}},
 	}
-	if err := writeFlagDrivenScaffold(path, "curl", result); err != nil {
+	if err := writeFlagDrivenScaffold(path, "curl", result, map[string][]string{"json": {"request"}}); err != nil {
 		t.Fatalf("writeFlagDrivenScaffold: %v", err)
 	}
 	data, err := os.ReadFile(path)
@@ -38,7 +38,7 @@ func TestWriteFlagDrivenScaffold(t *testing.T) {
 		t.Fatalf("read scaffold: %v", err)
 	}
 	text := string(data)
-	for _, want := range []string{"mode: flag_driven", "root_flags:", "capabilities:", "auto_discover: false"} {
+	for _, want := range []string{"mode: flag_driven", "root_flags:", "capabilities:", "synonyms:", "auto_discover: false"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("expected scaffold to contain %q\n%s", want, text)
 		}
