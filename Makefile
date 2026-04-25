@@ -24,11 +24,11 @@ build-apple:
 	cp $(APPLE_DIR)/.build/release/$(APPLE_BIN) $(BUILD_DIR)/$(APPLE_BIN)
 	@echo "Built: $(BUILD_DIR)/$(APPLE_BIN)"
 
-## install: Install nlci to /usr/local/bin (requires sudo)
+## install: Install nlci to ~/.local/bin (no sudo required)
 install: build
-	sudo install -d /usr/local/bin
-	sudo install -m 755 $(BUILD_DIR)/$(BINARY) /usr/local/bin/$(BINARY)
-	@echo "Installed: /usr/local/bin/$(BINARY)"
+	@mkdir -p $(HOME)/.local/bin
+	install -m 755 $(BUILD_DIR)/$(BINARY) $(HOME)/.local/bin/$(BINARY)
+	@echo "Installed: $(HOME)/.local/bin/$(BINARY)"
 
 ## install-apple: Install nlci-apple to ~/.config/nlci/bin/
 install-apple: build-apple

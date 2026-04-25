@@ -55,15 +55,28 @@ All inference runs on-device. No data leaves your machine.
 ## Installation
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/jakejimenez/nlci/main/install.sh | sh
+```
+
+Installs `nlci` to `~/.local/bin`. On macOS 26 + Apple Silicon, also builds and installs the Apple Intelligence bridge automatically. No `sudo` required.
+
+If `~/.local/bin` is not in your PATH, the script will tell you what to add to your shell profile.
+
+<details>
+<summary>Install from source manually</summary>
+
+```bash
 git clone https://github.com/jakejimenez/nlci
 cd nlci
 make build
-make install          # installs nlci to /usr/local/bin
+make install           # installs nlci to ~/.local/bin
 
-# Apple Intelligence backend (macOS 26 + Apple Silicon required)
+# Apple Intelligence bridge (macOS 26 + Apple Silicon)
 make build-apple
-make install-apple    # installs nlci-apple to ~/.config/nlci/bin/
+make install-apple     # installs nlci-apple to ~/.config/nlci/bin/
 ```
+
+</details>
 
 ## Usage
 
