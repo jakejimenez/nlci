@@ -3,10 +3,11 @@ APPLE_BIN  := nlci-apple
 BUILD_DIR  := bin
 GO_CMD     := cmd/nlci
 APPLE_DIR  := apple
+VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 
 APPLE_INSTALL_DIR := $(HOME)/.config/nlci/bin
 
-.PHONY: all build build-apple install install-apple clean test lint help
+.PHONY: all build build-apple install install-apple release clean test lint help
 
 all: build
 
@@ -50,6 +51,19 @@ lint:
 clean:
 	rm -rf $(BUILD_DIR)
 	cd $(APPLE_DIR) && swift package clean
+
+## release: Build a release tarball (Go binary + Swift binary) for distribution
+## Usage: VERSION=v0.1.0 make release
+release: build
+	@echo "Building release tarball for $(VERSION)..."
+	@mkdir -p dist
+	@cp $(BUILD_DIR)/$(BINARY) dist/
+	@if [ -f $(BUILD_DIR)/$(APPLE_BIN) ]; then cp $(BUILD_DIR)/$(APPLE_BIN) dist/; fi
+	@cp README.md dist/
+	@tar -czf dist/nlci-$(VERSION)-darwin-arm64.tar.gz -C dist $(BINARY) README.md \
+		$(shell [ -f dist/$(APPLE_BIN) ] && echo $(APPLE_BIN) || echo "")
+	@echo "Release: dist/nlci-$(VERSION)-darwin-arm64.tar.gz"
+	@shasum -a 256 dist/nlci-$(VERSION)-darwin-arm64.tar.gz
 
 ## help: Show this help message
 help:

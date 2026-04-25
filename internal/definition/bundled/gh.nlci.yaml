@@ -1,0 +1,375 @@
+name: gh
+description: GitHub CLI — manage repos, PRs, issues, Actions, and releases
+binary: gh
+
+system_prompt: |
+  You are an expert GitHub CLI user.
+  Your job is to translate natural language intent into exact gh commands.
+
+  Rules:
+  - Output ONLY the raw command — no markdown, no backticks, no explanation text
+  - The command MUST start with "gh"
+  - Use the most minimal flags that satisfy the intent
+  - For commands that target a specific PR, issue, or repo, use the identifiers
+    the user provides (numbers, URLs, names)
+  - If no repo is specified, assume the current directory's repo
+  - If the intent is ambiguous, choose the safest interpretation
+
+commands:
+  # ── Pull Requests ──────────────────────────────────────────────────────────
+
+  - name: "pr create"
+    description: Create a pull request
+    examples:
+      - nl: "create a pull request"
+        cmd: "gh pr create"
+      - nl: "open a PR with a title and body filled from commits"
+        cmd: "gh pr create --fill"
+      - nl: "create a draft pull request"
+        cmd: "gh pr create --draft"
+      - nl: "create a PR targeting the main branch"
+        cmd: "gh pr create --base main"
+      - nl: "open a pull request in the browser"
+        cmd: "gh pr create --web"
+
+  - name: "pr list"
+    description: List pull requests in the current repository
+    examples:
+      - nl: "list open pull requests"
+        cmd: "gh pr list"
+      - nl: "show all PRs including closed ones"
+        cmd: "gh pr list --state all"
+      - nl: "list my pull requests"
+        cmd: "gh pr list --author @me"
+      - nl: "show PRs assigned to me"
+        cmd: "gh pr list --assignee @me"
+      - nl: "list PRs with the bug label"
+        cmd: "gh pr list --label bug"
+      - nl: "show draft pull requests"
+        cmd: "gh pr list --draft"
+
+  - name: "pr view"
+    description: View a pull request
+    examples:
+      - nl: "view pull request 123"
+        cmd: "gh pr view 123"
+      - nl: "open PR 42 in the browser"
+        cmd: "gh pr view 42 --web"
+      - nl: "show the current branch's PR"
+        cmd: "gh pr view"
+
+  - name: "pr checkout"
+    description: Check out a pull request branch locally
+    examples:
+      - nl: "check out PR 88"
+        cmd: "gh pr checkout 88"
+      - nl: "switch to the branch for pull request 42"
+        cmd: "gh pr checkout 42"
+
+  - name: "pr merge"
+    description: Merge a pull request
+    examples:
+      - nl: "merge pull request 55"
+        cmd: "gh pr merge 55"
+      - nl: "squash and merge PR 12"
+        cmd: "gh pr merge 12 --squash"
+      - nl: "rebase merge PR 7"
+        cmd: "gh pr merge 7 --rebase"
+      - nl: "merge the current branch's PR"
+        cmd: "gh pr merge"
+      - nl: "merge PR 10 and delete the branch"
+        cmd: "gh pr merge 10 --delete-branch"
+
+  - name: "pr checks"
+    description: Show CI status for a pull request
+    examples:
+      - nl: "show CI checks for PR 33"
+        cmd: "gh pr checks 33"
+      - nl: "check if CI is passing for the current PR"
+        cmd: "gh pr checks"
+      - nl: "watch CI checks for PR 20 until they finish"
+        cmd: "gh pr checks 20 --watch"
+
+  - name: "pr review"
+    description: Add a review to a pull request
+    examples:
+      - nl: "approve pull request 15"
+        cmd: "gh pr review 15 --approve"
+      - nl: "request changes on PR 22"
+        cmd: "gh pr review 22 --request-changes"
+      - nl: "leave a comment on PR 8"
+        cmd: "gh pr review 8 --comment"
+
+  - name: "pr close"
+    description: Close a pull request without merging
+    examples:
+      - nl: "close pull request 44"
+        cmd: "gh pr close 44"
+      - nl: "close PR 3 and delete the branch"
+        cmd: "gh pr close 3 --delete-branch"
+
+  - name: "pr diff"
+    description: View changes in a pull request
+    examples:
+      - nl: "show the diff for PR 18"
+        cmd: "gh pr diff 18"
+      - nl: "view changes in the current PR"
+        cmd: "gh pr diff"
+
+  - name: "pr status"
+    description: Show status of relevant pull requests
+    examples:
+      - nl: "show my PR status"
+        cmd: "gh pr status"
+      - nl: "what's the status of my pull requests"
+        cmd: "gh pr status"
+
+  # ── Issues ─────────────────────────────────────────────────────────────────
+
+  - name: "issue create"
+    description: Create a new issue
+    examples:
+      - nl: "create a new issue"
+        cmd: "gh issue create"
+      - nl: "create a bug report"
+        cmd: "gh issue create --label bug"
+      - nl: "open a new issue in the browser"
+        cmd: "gh issue create --web"
+      - nl: "create an issue assigned to me"
+        cmd: "gh issue create --assignee @me"
+
+  - name: "issue list"
+    description: List issues in the current repository
+    examples:
+      - nl: "list open issues"
+        cmd: "gh issue list"
+      - nl: "show all issues including closed"
+        cmd: "gh issue list --state all"
+      - nl: "list issues assigned to me"
+        cmd: "gh issue list --assignee @me"
+      - nl: "show bug issues"
+        cmd: "gh issue list --label bug"
+      - nl: "list the last 20 issues"
+        cmd: "gh issue list --limit 20"
+
+  - name: "issue view"
+    description: View an issue
+    examples:
+      - nl: "view issue 101"
+        cmd: "gh issue view 101"
+      - nl: "open issue 55 in the browser"
+        cmd: "gh issue view 55 --web"
+
+  - name: "issue close"
+    description: Close an issue
+    examples:
+      - nl: "close issue 77"
+        cmd: "gh issue close 77"
+
+  - name: "issue comment"
+    description: Add a comment to an issue
+    examples:
+      - nl: "comment on issue 12"
+        cmd: "gh issue comment 12"
+
+  - name: "issue status"
+    description: Show status of relevant issues
+    examples:
+      - nl: "show my issue status"
+        cmd: "gh issue status"
+
+  # ── Repositories ───────────────────────────────────────────────────────────
+
+  - name: "repo clone"
+    description: Clone a repository locally
+    examples:
+      - nl: "clone cli/cli"
+        cmd: "gh repo clone cli/cli"
+      - nl: "clone the jakejimenez/nlci repo"
+        cmd: "gh repo clone jakejimenez/nlci"
+
+  - name: "repo view"
+    description: View a repository
+    examples:
+      - nl: "view the current repo"
+        cmd: "gh repo view"
+      - nl: "open this repo in the browser"
+        cmd: "gh repo view --web"
+      - nl: "view the cli/cli repo"
+        cmd: "gh repo view cli/cli"
+
+  - name: "repo create"
+    description: Create a new repository
+    examples:
+      - nl: "create a new public repo called myproject"
+        cmd: "gh repo create myproject --public"
+      - nl: "create a private repo"
+        cmd: "gh repo create --private"
+      - nl: "create a repo with a README"
+        cmd: "gh repo create myproject --public --add-readme"
+
+  - name: "repo fork"
+    description: Fork a repository
+    examples:
+      - nl: "fork cli/cli"
+        cmd: "gh repo fork cli/cli"
+      - nl: "fork and clone this repo"
+        cmd: "gh repo fork --clone"
+
+  - name: "repo list"
+    description: List repositories owned by a user or organization
+    examples:
+      - nl: "list my repositories"
+        cmd: "gh repo list"
+      - nl: "list repos for the jakejimenez user"
+        cmd: "gh repo list jakejimenez"
+      - nl: "show my private repos"
+        cmd: "gh repo list --visibility private"
+
+  # ── GitHub Actions Runs ────────────────────────────────────────────────────
+
+  - name: "run list"
+    description: List recent workflow runs
+    examples:
+      - nl: "list recent workflow runs"
+        cmd: "gh run list"
+      - nl: "show the last 10 workflow runs"
+        cmd: "gh run list --limit 10"
+      - nl: "list failed workflow runs"
+        cmd: "gh run list --status failure"
+      - nl: "show runs for the CI workflow"
+        cmd: "gh run list --workflow CI"
+
+  - name: "run view"
+    description: View a workflow run
+    examples:
+      - nl: "view the latest workflow run"
+        cmd: "gh run view"
+      - nl: "view run 987654321"
+        cmd: "gh run view 987654321"
+      - nl: "open the latest run in the browser"
+        cmd: "gh run view --web"
+
+  - name: "run watch"
+    description: Watch a workflow run until it completes
+    examples:
+      - nl: "watch the current workflow run"
+        cmd: "gh run watch"
+      - nl: "watch run 987654321 until it finishes"
+        cmd: "gh run watch 987654321"
+
+  - name: "run rerun"
+    description: Rerun a failed workflow run
+    examples:
+      - nl: "rerun the last failed workflow"
+        cmd: "gh run rerun --failed"
+      - nl: "rerun run 987654321"
+        cmd: "gh run rerun 987654321"
+
+  # ── Releases ───────────────────────────────────────────────────────────────
+
+  - name: "release create"
+    description: Create a new release
+    examples:
+      - nl: "create release v1.0.0"
+        cmd: "gh release create v1.0.0"
+      - nl: "create a draft release for v2.0.0"
+        cmd: "gh release create v2.0.0 --draft"
+      - nl: "create a pre-release tagged v1.0.0-beta"
+        cmd: "gh release create v1.0.0-beta --prerelease"
+
+  - name: "release list"
+    description: List releases in the current repository
+    examples:
+      - nl: "list releases"
+        cmd: "gh release list"
+      - nl: "show all releases"
+        cmd: "gh release list --limit 100"
+
+  - name: "release view"
+    description: View a release
+    examples:
+      - nl: "view the latest release"
+        cmd: "gh release view"
+      - nl: "view release v1.2.0"
+        cmd: "gh release view v1.2.0"
+
+  # ── Search ─────────────────────────────────────────────────────────────────
+
+  - name: "search repos"
+    description: Search for repositories on GitHub
+    examples:
+      - nl: "search for repos about natural language CLI"
+        cmd: "gh search repos \"natural language CLI\""
+      - nl: "find popular Go CLI frameworks"
+        cmd: "gh search repos --language go CLI --sort stars"
+
+  - name: "search issues"
+    description: Search for issues across GitHub
+    examples:
+      - nl: "search for open issues about memory leak"
+        cmd: "gh search issues \"memory leak\" --state open"
+      - nl: "find issues assigned to me across all repos"
+        cmd: "gh search issues --assignee @me --state open"
+
+  - name: "search prs"
+    description: Search for pull requests across GitHub
+    examples:
+      - nl: "search for open PRs mentioning performance"
+        cmd: "gh search prs \"performance\" --state open"
+
+  # ── Status & Browse ────────────────────────────────────────────────────────
+
+  - name: "status"
+    description: Show notifications, assignments, and review requests across repos
+    examples:
+      - nl: "show my github status"
+        cmd: "gh status"
+      - nl: "what needs my attention on github"
+        cmd: "gh status"
+
+  - name: "browse"
+    description: Open the repository in the browser
+    examples:
+      - nl: "open this repo in the browser"
+        cmd: "gh browse"
+      - nl: "open the issues page in the browser"
+        cmd: "gh browse --issues"
+      - nl: "open the projects page"
+        cmd: "gh browse --projects"
+      - nl: "view file main.go in the browser"
+        cmd: "gh browse main.go"
+
+safety:
+  require_confirmation:
+    - "gh pr merge"
+    - "gh pr close"
+    - "gh issue close"
+    - "gh issue delete"
+    - "gh repo delete"
+    - "gh release delete"
+
+  forbidden:
+    - "gh repo delete --yes"
+
+synonyms:
+  open: ["browse", "view"]
+  show: ["list", "view", "status"]
+  see: ["list", "view"]
+  my: ["pr list", "issue list", "status"]
+  failing: ["run list"]
+  ci: ["run list", "pr checks", "run view"]
+  checks: ["pr checks", "run list"]
+  approve: ["pr review"]
+  merge: ["pr merge"]
+  checkout: ["pr checkout"]
+  switch: ["pr checkout"]
+  fork: ["repo fork"]
+  clone: ["repo clone"]
+  tag: ["release create"]
+  ship: ["release create"]
+  watch: ["run watch"]
+  rerun: ["run rerun"]
+  retry: ["run rerun"]
+
+auto_discover: true

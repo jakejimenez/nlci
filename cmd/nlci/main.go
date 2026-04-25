@@ -20,15 +20,29 @@ var (
 
 func main() {
 	root := &cobra.Command{
-		Use:   "nlci",
+		Use:   "nlci <tool> \"<intent>\"",
 		Short: "Natural language interface for any CLI tool",
 		Long: `nlci wraps any CLI tool with natural language understanding.
 Uses on-device inference via Apple Intelligence, Ollama, llama.cpp, or LM Studio.
 
 Examples:
   nlci docker "show me running containers"
-  nlci kubectl "restart the auth deployment in production"
-  nlci docker "clean up stopped containers" --dry-run`,
+  nlci gh "list my open pull requests"
+  nlci docker "clean up stopped containers" --dry-run
+  nlci gh "create a draft PR" --explain`,
+		// ArbitraryArgs lets unknown subcommand names (tool names) fall through
+		// to this RunE instead of erroring.
+		Args: cobra.ArbitraryArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) < 2 {
+				return cmd.Help()
+			}
+			toolName := args[0]
+			intent := args[1]
+			return runTool(cmd.Context(), toolName, intent)
+		},
+		// Silence usage on runtime errors — don't print full help on inference failure
+		SilenceUsage: true,
 	}
 
 	root.PersistentFlags().BoolVar(&flagDryRun, "dry-run", false, "Print the generated command without executing it")
@@ -36,7 +50,6 @@ Examples:
 	root.PersistentFlags().StringVar(&flagBackend, "backend", "", "Force a specific backend (apple, ollama, llamacpp, lmstudio)")
 
 	root.AddCommand(
-		newRunCmd(),
 		newInitCmd(),
 		newConfigCmd(),
 	)
@@ -44,24 +57,6 @@ Examples:
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
 	}
-}
-
-// newRunCmd returns the implicit "run" command — invoked as:
-// nlci <tool> "<intent>"
-func newRunCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "<tool> <intent>",
-		Short: "Translate natural language intent to a CLI command and run it",
-		Args:  cobra.MinimumNArgs(2),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			toolName := args[0]
-			intent := args[1]
-			return runTool(cmd.Context(), toolName, intent)
-		},
-		// Disable the default help flag so it doesn't conflict with passing --help to tools
-		DisableFlagParsing: false,
-	}
-	return cmd
 }
 
 func runTool(ctx context.Context, toolName, intent string) error {
@@ -72,7 +67,7 @@ func runTool(ctx context.Context, toolName, intent string) error {
 
 	def, err := definition.Load(toolName, cfg.Definitions.Paths)
 	if err != nil {
-		return fmt.Errorf("could not load definition for %q: %w", toolName, err)
+		return fmt.Errorf("could not load definition for %q: %w\n\nRun 'nlci init %s' to scaffold a definition", toolName, err, toolName)
 	}
 
 	br := buildBackendRouter(cfg, flagBackend)
@@ -90,12 +85,12 @@ func runTool(ctx context.Context, toolName, intent string) error {
 // newInitCmd scaffolds a *.nlci.yaml from a tool's --help output.
 func newInitCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "init <tool>",
-		Short: "Scaffold a *.nlci.yaml definition from a tool's --help output",
-		Args:  cobra.ExactArgs(1),
+		Use:          "init <tool>",
+		Short:        "Scaffold a *.nlci.yaml definition from a tool's --help output",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			toolName := args[0]
-			return runInit(toolName)
+			return runInit(args[0])
 		},
 	}
 }
@@ -108,61 +103,64 @@ func runInit(toolName string) error {
 		return fmt.Errorf("init: could not discover %q: %w", toolName, err)
 	}
 
-	def := &definition.CLIDefinition{
-		Name:         toolName,
-		Description:  toolName + " CLI",
-		Binary:       toolName,
-		AutoDiscover: true,
-		Commands:     commands,
+	filename := toolName + ".nlci.yaml"
+
+	// Don't overwrite an existing definition
+	if _, err := os.Stat(filename); err == nil {
+		return fmt.Errorf("init: %s already exists — delete it first to re-scaffold", filename)
 	}
 
-	// Write scaffold YAML
-	filename := toolName + ".nlci.yaml"
-	if err := writeScaffold(filename, def); err != nil {
+	if err := writeScaffold(filename, toolName, commands); err != nil {
 		return err
 	}
 
 	fmt.Printf("Created %s with %d discovered commands.\n", filename, len(commands))
-	fmt.Printf("Next: add examples and a system_prompt to %s\n", filename)
+	fmt.Println()
+	fmt.Println("Next steps:")
+	fmt.Printf("  1. Add examples to each command in %s\n", filename)
+	fmt.Printf("  2. Write a system_prompt describing the tool\n")
+	fmt.Printf("  3. Run: nlci %s \"<your intent>\" --dry-run\n", toolName)
 	return nil
 }
 
-func writeScaffold(filename string, def *definition.CLIDefinition) error {
+func writeScaffold(filename, toolName string, commands []definition.Command) error {
 	f, err := os.Create(filename)
 	if err != nil {
-		return fmt.Errorf("init: create file: %w", err)
+		return fmt.Errorf("init: create %s: %w", filename, err)
 	}
 	defer f.Close()
 
-	fmt.Fprintf(f, "name: %s\n", def.Name)
-	fmt.Fprintf(f, "description: %s\n", def.Description)
-	fmt.Fprintf(f, "binary: %s\n", def.Binary)
-	fmt.Fprintf(f, "\nsystem_prompt: |\n  You are an expert %s user. Generate precise %s commands.\n  Output only the raw command.\n", def.Name, def.Binary)
+	fmt.Fprintf(f, "name: %s\n", toolName)
+	fmt.Fprintf(f, "description: %s CLI\n", toolName)
+	fmt.Fprintf(f, "binary: %s\n", toolName)
+	fmt.Fprintf(f, "\nsystem_prompt: |\n")
+	fmt.Fprintf(f, "  You are an expert %s user. Generate precise %s commands.\n", toolName, toolName)
+	fmt.Fprintf(f, "  Output only the raw command — no markdown, no explanation.\n")
 	fmt.Fprintf(f, "\ncommands:\n")
 
-	for _, c := range def.Commands {
+	for _, c := range commands {
 		fmt.Fprintf(f, "  - name: %s\n", c.Name)
 		if c.Description != "" {
 			fmt.Fprintf(f, "    description: %s\n", c.Description)
 		}
 		fmt.Fprintf(f, "    examples:\n")
 		fmt.Fprintf(f, "      # - nl: \"...\"\n")
-		fmt.Fprintf(f, "      #   cmd: \"%s %s ...\"\n\n", def.Binary, c.Name)
+		fmt.Fprintf(f, "      #   cmd: \"%s %s ...\"\n\n", toolName, c.Name)
 	}
 
 	fmt.Fprintf(f, "safety:\n")
 	fmt.Fprintf(f, "  require_confirmation: []\n")
 	fmt.Fprintf(f, "  forbidden: []\n")
 	fmt.Fprintf(f, "\nauto_discover: true\n")
-
 	return nil
 }
 
 // newConfigCmd shows current configuration and backend status.
 func newConfigCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "config",
-		Short: "Show current configuration and backend health",
+		Use:          "config",
+		Short:        "Show current configuration and backend health",
+		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runConfig(cmd.Context())
 		},
@@ -175,22 +173,32 @@ func runConfig(ctx context.Context) error {
 		return err
 	}
 
-	fmt.Println("Backend priority:", cfg.Backend.Priority)
-	fmt.Printf("Ollama:    %s (model: %s)\n", cfg.Backend.Ollama.Host, cfg.Backend.Ollama.Model)
-	fmt.Printf("llama.cpp: %s\n", cfg.Backend.LlamaCpp.Host)
-	fmt.Printf("LM Studio: %s\n", cfg.Backend.LMStudio.Host)
-	fmt.Printf("nlci-apple binary: %s\n\n", cfg.Apple.Binary)
+	fmt.Println("Configuration")
+	fmt.Println("─────────────────────────────────────")
+	fmt.Printf("  Backend priority:  %v\n", cfg.Backend.Priority)
+	fmt.Printf("  Ollama:            %s  (model: %s)\n", cfg.Backend.Ollama.Host, cfg.Backend.Ollama.Model)
+	fmt.Printf("  llama.cpp:         %s\n", cfg.Backend.LlamaCpp.Host)
+	fmt.Printf("  LM Studio:         %s\n", cfg.Backend.LMStudio.Host)
+	fmt.Printf("  nlci-apple:        %s\n", cfg.Apple.Binary)
+	fmt.Println()
 
-	fmt.Println("Backend health:")
+	fmt.Println("Backend Health")
+	fmt.Println("─────────────────────────────────────")
 	br := buildBackendRouter(cfg, "")
-	for name, err := range br.Status(ctx) {
+	status := br.Status(ctx)
+	for _, name := range cfg.Backend.Priority {
+		err := status[name]
 		if err == nil {
-			fmt.Printf("  %-12s healthy\n", name)
+			fmt.Printf("  %-12s  healthy\n", name)
 		} else {
-			fmt.Printf("  %-12s unavailable (%s)\n", name, err)
+			fmt.Printf("  %-12s  unavailable\n", name)
 		}
 	}
+	fmt.Println()
 
+	fmt.Println("Bundled Definitions")
+	fmt.Println("─────────────────────────────────────")
+	fmt.Println("  docker   gh")
 	return nil
 }
 
