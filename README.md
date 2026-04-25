@@ -11,6 +11,46 @@ nlci docker "clean up stopped containers"
 Run this command? [y/N]
 ```
 
+## Requirements
+
+**Apple Intelligence backend** (primary, on-device, fastest)
+- macOS 26 (Tahoe) or later
+- Apple Silicon (M1 or later)
+- Apple Intelligence enabled in System Settings → Apple Intelligence
+- Xcode installed (the macOS 26 SDK is bundled — no separate download)
+
+**Ollama / llama.cpp / LM Studio** (any Mac, Intel or Apple Silicon)
+- One of: [Ollama](https://ollama.com), [llama.cpp server](https://github.com/ggerganov/llama.cpp), [LM Studio](https://lmstudio.ai)
+- A model loaded (e.g. `ollama pull llama3.2:3b`)
+
+The install script auto-detects your setup and configures accordingly.
+
+## Installation
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jakejimenez/nlci/main/install.sh | sh
+```
+
+Installs `nlci` to `~/.local/bin`. On macOS 26 + Apple Silicon, also builds and installs the Apple Intelligence bridge automatically. No `sudo` required.
+
+If `~/.local/bin` is not in your PATH, the script will tell you what to add to your shell profile.
+
+<details>
+<summary>Install from source manually</summary>
+
+```bash
+git clone https://github.com/jakejimenez/nlci
+cd nlci
+make build
+make install           # installs nlci to ~/.local/bin
+
+# Apple Intelligence bridge (macOS 26 + Apple Silicon)
+make build-apple
+make install-apple     # installs nlci-apple to ~/.config/nlci/bin/
+```
+
+</details>
+
 ## How it works
 
 nlci sits between you and any CLI tool. You describe what you want in plain English; nlci translates it to the exact command, explains it, asks for confirmation on destructive operations, and runs it.
@@ -38,45 +78,6 @@ Agentic loop        inject --help + error context → retry (max 3×)
 ```
 
 All inference runs on-device. No data leaves your machine.
-
-## Requirements
-
-**For Apple Intelligence backend:**
-- macOS 26 (Tahoe) or later
-- Apple Silicon (M1 or later)
-- Apple Intelligence enabled in System Settings
-- Xcode (the version bundled with macOS 26 already includes the macOS 26 SDK — no separate download needed)
-
-**For Ollama / llama.cpp / LM Studio backend:**
-- Any Mac (Intel or Apple Silicon)
-- One of: [Ollama](https://ollama.com), [llama.cpp server](https://github.com/ggerganov/llama.cpp), or [LM Studio](https://lmstudio.ai)
-- A 3B parameter model (e.g. `llama3.2:3b` via Ollama)
-
-## Installation
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/jakejimenez/nlci/main/install.sh | sh
-```
-
-Installs `nlci` to `~/.local/bin`. On macOS 26 + Apple Silicon, also builds and installs the Apple Intelligence bridge automatically. No `sudo` required.
-
-If `~/.local/bin` is not in your PATH, the script will tell you what to add to your shell profile.
-
-<details>
-<summary>Install from source manually</summary>
-
-```bash
-git clone https://github.com/jakejimenez/nlci
-cd nlci
-make build
-make install           # installs nlci to ~/.local/bin
-
-# Apple Intelligence bridge (macOS 26 + Apple Silicon)
-make build-apple
-make install-apple     # installs nlci-apple to ~/.config/nlci/bin/
-```
-
-</details>
 
 ## Usage
 
