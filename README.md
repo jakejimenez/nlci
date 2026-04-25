@@ -59,16 +59,16 @@ nlci sits between you and any CLI tool. You describe what you want in plain Engl
 Your intent
     │
     ▼
-Retrieval index     lexical top-K match against command names, descriptions, examples
+Retrieval index     lexical top-K match against commands or capabilities
     │
     ▼
-Prompt builder      system prompt + candidate schema + few-shot examples + live --help + intent
+Prompt builder      system prompt + candidate schema + few-shot examples + intent
     │
     ▼
 Inference backend   Apple Intelligence → Ollama → llama.cpp → LM Studio
     │
     ▼
-Validator           schema conformance + safety rules
+Validator           schema conformance + safety rules + placeholder/flag checks
     │
     ▼
 Executor            confirm (if needed) → run → stream output
@@ -104,6 +104,9 @@ nlci config
 
 # Scaffold a definition for any CLI tool
 nlci init kubectl
+
+# Flag-driven tools work too
+nlci init curl
 ```
 
 ## Bundled definitions
@@ -115,12 +118,21 @@ nlci init kubectl
 
 ## Defining your own CLI
 
-Run `nlci init <tool>` to scaffold a definition from the tool's `--help` output:
+Run `nlci init <tool>` to scaffold a definition from the tool's `--help` output. `init` now chooses between two modes automatically:
+- `command_tree` for CLIs like `docker`, `gh`, and `brew`
+- `flag_driven` for CLIs like `curl`
+
+The generated scaffold includes verified command or flag inventory, deterministic active examples, and generated synonyms so the YAML is usable before manual edits.
+
+Example:
 
 ```bash
 nlci init kubectl
 # Creates kubectl.nlci.yaml in the current directory
-# Edit it to add examples and a system_prompt
+# Review the generated examples/synonyms, then refine as needed
+
+nlci init curl
+# Creates curl.nlci.yaml in flag_driven mode with root_flags + capabilities
 ```
 
 Or write one by hand:
@@ -130,6 +142,7 @@ Or write one by hand:
 name: mytool
 description: My CLI tool
 binary: mytool
+mode: command_tree
 
 system_prompt: |
   You are an expert mytool user. Generate precise mytool commands.
@@ -148,15 +161,46 @@ safety:
   forbidden:
     - "mytool delete --all --force"
 
-# true = also discover commands from `mytool --help` at runtime
-auto_discover: true
+synonyms:
+  show:
+    - query
+
+# false = use the generated scaffold as-is (recommended for init output)
+auto_discover: false
+```
+
+Flag-driven YAMLs look like this:
+
+```yaml
+name: curl
+binary: curl
+mode: flag_driven
+
+root_flags:
+  - name: output
+    short: o
+    value_hint: file
+    description: Write to file instead of stdout
+
+capabilities:
+  - name: output
+    description: Control where response bodies are written
+    flags: [output]
+    examples:
+      - nl: "save https://example.com to index.html"
+        cmd: "curl --output index.html https://example.com"
 ```
 
 nlci searches for definitions in this order:
 1. `<tool>.nlci.yaml` in the current directory
 2. `~/.config/nlci/definitions/`
 3. Bundled definitions (`docker`, `gh`)
-4. Zero-config: auto-discover from `<tool> --help`
+4. Zero-config: deterministic discovery from the tool's help/inventory surface
+
+Notes:
+- Bundled definitions are hand-tuned and ship with the binary.
+- `init` output is generic and intended to be a strong first draft, not the final form.
+- Hand-authored YAML always wins; you can refine examples, synonyms, and safety rules later.
 
 ## Configuration
 
@@ -214,11 +258,11 @@ nlci/
 │   └── Sources/NLCIApple/   @Generable CommandResult, App.swift entry point
 ├── cmd/nlci/                Cobra CLI: run, init, config
 ├── internal/
-│   ├── definition/          YAML loader + --help auto-discovery (one level deep)
-│   ├── retrieval/           Lexical top-K retrieval index (no model call)
+│   ├── definition/          YAML loader + command-tree/flag-driven discovery + scaffold enrichment
+│   ├── retrieval/           Lexical top-K retrieval index for commands or capabilities
 │   ├── prompt/              Prompt builder + 3,500-token budget enforcer
 │   ├── backend/             Apple subprocess + OpenAI-compat (Ollama/llama.cpp/LM Studio)
-│   ├── validator/           Schema conformance + safety rules
+│   ├── validator/           Schema conformance + safety rules + placeholder/flag validation
 │   ├── executor/            Confirm prompt + subprocess execution
 │   └── agent/               Retrieve → infer → validate → execute loop (max 3×)
 ├── config/                  ~/.config/nlci/config.yaml
@@ -230,7 +274,7 @@ The Swift binary (`nlci-apple`) is a subprocess invoked per-request. It reads a 
 
 ## Token budget
 
-Apple Intelligence has a 4,096-token context window. nlci keeps within a 3,500-token safe ceiling. The retrieval step sends only the top-K matched commands to the prompt builder (not the full schema), which keeps typical requests well under budget even for large CLI definitions.
+Apple Intelligence has a 4,096-token context window. nlci keeps within a 3,500-token safe ceiling. The retrieval step sends only the top-K matched commands or capabilities to the prompt builder (not the full schema), which keeps typical requests well under budget even for large CLI definitions.
 
 ## Verification
 
@@ -248,6 +292,10 @@ make build
 make build-apple && make install-apple
 ./bin/nlci docker "show me running containers" --dry-run
 ./bin/nlci docker "remove all stopped containers" --dry-run  # triggers confirmation prompt
+
+# 4b. Scaffold a new CLI definition
+./bin/nlci init brew
+./bin/nlci init curl
 
 # 5. Ollama (any Mac)
 ollama pull llama3.2:3b && ollama serve &
