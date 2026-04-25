@@ -24,10 +24,10 @@ build-apple:
 	cp $(APPLE_DIR)/.build/release/$(APPLE_BIN) $(BUILD_DIR)/$(APPLE_BIN)
 	@echo "Built: $(BUILD_DIR)/$(APPLE_BIN)"
 
-## install: Install nlci to /usr/local/bin
+## install: Install nlci to /usr/local/bin (requires sudo)
 install: build
-	install -d /usr/local/bin
-	install -m 755 $(BUILD_DIR)/$(BINARY) /usr/local/bin/$(BINARY)
+	sudo install -d /usr/local/bin
+	sudo install -m 755 $(BUILD_DIR)/$(BINARY) /usr/local/bin/$(BINARY)
 	@echo "Installed: /usr/local/bin/$(BINARY)"
 
 ## install-apple: Install nlci-apple to ~/.config/nlci/bin/
@@ -52,16 +52,19 @@ clean:
 	rm -rf $(BUILD_DIR)
 	cd $(APPLE_DIR) && swift package clean
 
-## release: Build a release tarball (Go binary + Swift binary) for distribution
+## release: Build a release tarball (Go binary + Swift binary if present) for distribution
 ## Usage: VERSION=v0.1.0 make release
 release: build
 	@echo "Building release tarball for $(VERSION)..."
 	@mkdir -p dist
 	@cp $(BUILD_DIR)/$(BINARY) dist/
-	@if [ -f $(BUILD_DIR)/$(APPLE_BIN) ]; then cp $(BUILD_DIR)/$(APPLE_BIN) dist/; fi
+	@[ -f $(BUILD_DIR)/$(APPLE_BIN) ] && cp $(BUILD_DIR)/$(APPLE_BIN) dist/ || true
 	@cp README.md dist/
-	@tar -czf dist/nlci-$(VERSION)-darwin-arm64.tar.gz -C dist $(BINARY) README.md \
-		$(shell [ -f dist/$(APPLE_BIN) ] && echo $(APPLE_BIN) || echo "")
+	@if [ -f dist/$(APPLE_BIN) ]; then \
+		tar -czf dist/nlci-$(VERSION)-darwin-arm64.tar.gz -C dist $(BINARY) $(APPLE_BIN) README.md; \
+	else \
+		tar -czf dist/nlci-$(VERSION)-darwin-arm64.tar.gz -C dist $(BINARY) README.md; \
+	fi
 	@echo "Release: dist/nlci-$(VERSION)-darwin-arm64.tar.gz"
 	@shasum -a 256 dist/nlci-$(VERSION)-darwin-arm64.tar.gz
 

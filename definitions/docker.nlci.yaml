@@ -22,7 +22,7 @@ commands:
         cmd: "docker ps -a"
       - nl: "show containers with their disk sizes"
         cmd: "docker ps -s"
-      - nl: "show containers using more than 500MB"
+      - nl: "list only running containers with sizes"
         cmd: "docker ps -s --filter status=running"
 
   - name: run
@@ -147,4 +147,4 @@ synonyms:
   tail: ["logs"]
   inside: ["exec"]
 
-auto_discover: true
+auto_discover: false

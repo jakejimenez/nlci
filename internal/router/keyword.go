@@ -23,15 +23,30 @@ type Match struct {
 func KeywordMatch(intent string, subcommands []string, synonyms map[string][]string) Match {
 	tokens := tokenize(intent)
 
-	// Stage 1: exact subcommand name overlap
+	// Stage 1: ALL subcommand tokens must be present in the intent tokens.
+	// Requiring full coverage prevents "ps" from matching "system prune"
+	// just because "prune" shares a token with "pruning".
 	for _, sub := range subcommands {
 		subTokens := tokenize(sub)
+		if len(subTokens) == 0 {
+			continue
+		}
+		allFound := true
 		for _, st := range subTokens {
+			found := false
 			for _, it := range tokens {
 				if st == it {
-					return Match{Subcommand: sub, Confidence: ConfidenceHigh}
+					found = true
+					break
 				}
 			}
+			if !found {
+				allFound = false
+				break
+			}
+		}
+		if allFound {
+			return Match{Subcommand: sub, Confidence: ConfidenceHigh}
 		}
 	}
 

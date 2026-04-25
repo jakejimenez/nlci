@@ -1,12 +1,12 @@
 # nlci
 
-Natural language interface layer for any CLI tool. Drop a YAML file, get `docker "show me containers using more than 500MB"`. Powered by Apple Intelligence or llama.cpp — no cloud, no API keys.
+Natural language interface layer for any CLI tool. Drop a YAML file, get `nlci docker "clean up stopped containers"`. Powered by Apple Intelligence or llama.cpp — no cloud, no API keys.
 
 ```
-nlci docker "show me containers using more than 500MB"
+nlci docker "clean up stopped containers"
 
-  > docker ps -s --filter status=running
-    Lists running containers and their disk usage sizes
+  > docker rm $(docker ps -aq -f status=exited)
+    Removes all stopped containers by their IDs
 
 Run this command? [y/N]
 ```
@@ -45,6 +45,7 @@ All inference runs on-device. No data leaves your machine.
 - macOS 26 (Tahoe) or later
 - Apple Silicon (M1 or later)
 - Apple Intelligence enabled in System Settings
+- Xcode (the version bundled with macOS 26 already includes the macOS 26 SDK — no separate download needed)
 
 **For Ollama / llama.cpp / LM Studio backend:**
 - Any Mac (Intel or Apple Silicon)
@@ -70,6 +71,10 @@ make install-apple    # installs nlci-apple to ~/.config/nlci/bin/
 # Use a bundled definition (docker, gh)
 nlci docker "show me running containers"
 nlci gh "list my open pull requests"
+
+# Quotes are optional for multi-word intents
+nlci docker show me running containers
+nlci gh list my open pull requests
 
 # Dry-run: see the command without executing it
 nlci docker "clean up stopped containers" --dry-run
@@ -129,6 +134,7 @@ safety:
   forbidden:
     - "mytool delete --all --force"
 
+# true = also discover commands from `mytool --help` at runtime
 auto_discover: true
 ```
 
@@ -167,18 +173,21 @@ nlci tries each backend in priority order and uses the first healthy one. Run `n
 import "github.com/jakejimenez/nlci"
 
 // Full pipeline: infer + confirm + execute
-client, err := nlci.New(nlci.Config{
-    ToolName: "docker",
-    DryRun:   false,
-})
+client, err := nlci.New(nlci.Config{ToolName: "docker"})
+if err != nil {
+    log.Fatal(err)
+}
 if err := client.Run(ctx, "show me running containers"); err != nil {
     log.Fatal(err)
 }
 
 // Inference only — no execution
 result, err := client.Generate(ctx, "clean up stopped containers")
-fmt.Println(result.Command)      // docker system prune
-fmt.Println(result.Explanation)  // Removes stopped containers, unused images...
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Println(result.Command)      // docker rm $(docker ps -aq -f status=exited)
+fmt.Println(result.Explanation)  // Removes all stopped containers
 fmt.Println(result.Backend)      // apple
 fmt.Println(result.Attempts)     // 1
 ```
@@ -188,7 +197,7 @@ fmt.Println(result.Attempts)     // 1
 ```
 nlci/
 ├── apple/                   Swift Package — Apple Intelligence bridge
-│   └── Sources/NLCIApple/   @Generable CommandResult, RunLoop, EOF guard
+│   └── Sources/NLCIApple/   @Generable CommandResult, App.swift entry point
 ├── cmd/nlci/                Cobra CLI: run, init, config
 ├── internal/
 │   ├── definition/          YAML loader + --help auto-discovery
@@ -208,6 +217,28 @@ The Swift binary (`nlci-apple`) is a subprocess invoked per-request. It reads a 
 ## Token budget
 
 Apple Intelligence has a 4,096-token context window. A typical nlci request uses ~955 tokens, leaving ~3,141 tokens of headroom. For large CLI schemas, the prompt builder pre-filters commands by keyword relevance before sending.
+
+## Verification
+
+```bash
+# 1. Build the Go binary
+make build
+
+# 2. Check backend health
+./bin/nlci config
+
+# 3. Dry-run with no backend — should fail with a clear "no inference backend" message
+./bin/nlci docker "show me running containers" --dry-run
+
+# 4. Apple Intelligence (macOS 26 + Apple Silicon)
+make build-apple && make install-apple
+./bin/nlci docker "show me running containers" --dry-run
+./bin/nlci docker "remove all stopped containers" --dry-run  # triggers confirmation prompt
+
+# 5. Ollama (any Mac)
+ollama pull llama3.2:3b && ollama serve &
+./bin/nlci docker "show me running containers" --dry-run
+```
 
 ## License
 

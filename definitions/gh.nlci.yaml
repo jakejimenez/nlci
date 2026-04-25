@@ -372,4 +372,4 @@ synonyms:
   rerun: ["run rerun"]
   retry: ["run rerun"]
 
-auto_discover: true
+auto_discover: false

@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
+	"strings"
+	"syscall"
 
 	"github.com/spf13/cobra"
 	"github.com/jakejimenez/nlci/config"
@@ -19,6 +22,10 @@ var (
 )
 
 func main() {
+	// Signal-aware root context: Ctrl-C cancels inference and execution cleanly.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	root := &cobra.Command{
 		Use:   "nlci <tool> \"<intent>\"",
 		Short: "Natural language interface for any CLI tool",
@@ -34,11 +41,18 @@ Examples:
 		// to this RunE instead of erroring.
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if len(args) < 2 {
+			if len(args) < 1 {
 				return cmd.Help()
 			}
 			toolName := args[0]
-			intent := args[1]
+			// Join remaining args so unquoted multi-word intents work:
+			//   nlci docker show me running containers
+			// is equivalent to:
+			//   nlci docker "show me running containers"
+			if len(args) < 2 {
+				return cmd.Help()
+			}
+			intent := strings.Join(args[1:], " ")
 			return runTool(cmd.Context(), toolName, intent)
 		},
 		// Silence usage on runtime errors — don't print full help on inference failure
@@ -54,7 +68,7 @@ Examples:
 		newConfigCmd(),
 	)
 
-	if err := root.Execute(); err != nil {
+	if err := root.ExecuteContext(ctx); err != nil {
 		os.Exit(1)
 	}
 }

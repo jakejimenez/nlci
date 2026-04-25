@@ -16,12 +16,10 @@ struct CommandResult {
 func buildPrompt(_ input: BridgeInput) -> String {
     var parts: [String] = []
 
-    // Schema
     if !input.schema.isEmpty {
         parts.append("Available commands:\n\(input.schema)")
     }
 
-    // Few-shot examples
     if !input.examples.isEmpty {
         var exLines = "Examples:"
         for ex in input.examples {
@@ -40,7 +38,7 @@ func buildPrompt(_ input: BridgeInput) -> String {
 struct NLCIApple {
     static func main() {
         Task {
-            // --ping mode: just check availability and exit
+            // --ping mode: check availability and exit
             if CommandLine.arguments.contains("--ping") {
                 if let errStr = checkAvailability() {
                     emit(BridgeOutput(error: errStr))
@@ -74,9 +72,7 @@ struct NLCIApple {
 
             // Run inference
             do {
-                let session = LanguageModelSession(
-                    instructions: input.system
-                )
+                let session = LanguageModelSession(instructions: input.system)
 
                 let response = try await session.respond(
                     to: buildPrompt(input),

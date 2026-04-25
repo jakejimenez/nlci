@@ -7,9 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"os/signal"
 	"strings"
-	"syscall"
 )
 
 // AppleBackend runs inference via the nlci-apple Swift subprocess.
@@ -60,10 +58,16 @@ func (a *AppleBackend) Ping(ctx context.Context) error {
 // Generate runs the Swift subprocess, sends the request via stdin,
 // and reads the response from stdout.
 func (a *AppleBackend) Generate(ctx context.Context, r Request) (Response, error) {
+	// Ensure Examples is never marshalled as JSON null — Swift's non-optional
+	// [[String]] decoder will throw on null even with decodeIfPresent as a safeguard.
+	examples := r.Examples
+	if examples == nil {
+		examples = make([][2]string, 0)
+	}
 	input := bridgeInput{
 		System:   r.System,
 		Schema:   r.Schema,
-		Examples: r.Examples,
+		Examples: examples,
 		Intent:   r.Intent,
 	}
 
@@ -78,24 +82,6 @@ func (a *AppleBackend) Generate(ctx context.Context, r Request) (Response, error
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-
-	// Signal handler: ensure the Swift child is killed when this process exits
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-sigCh:
-			if cmd.Process != nil {
-				_ = cmd.Process.Kill()
-			}
-		case <-done:
-		}
-	}()
-	defer func() {
-		close(done)
-		signal.Stop(sigCh)
-	}()
 
 	if err := cmd.Run(); err != nil {
 		// Check if stderr contains useful diagnostic info

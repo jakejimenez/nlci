@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "NLCIApple",
     platforms: [
-        .macOS(.v26) // Foundation Models framework requires macOS 26 (Tahoe)
+        .macOS("26.0") // Foundation Models requires macOS 26 (Tahoe); use string form until Xcode ships the .v26 enum
     ],
     targets: [
         .executableTarget(

@@ -9,5 +9,7 @@ func checkAvailability() -> String? {
         return nil
     case .unavailable(let reason):
         return "unavailable:\(reason)"
+    @unknown default:
+        return "unavailable:unknown"
     }
 }
