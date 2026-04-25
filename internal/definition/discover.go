@@ -262,6 +262,32 @@ func parseFlags(text string) []Flag {
 	return flags
 }
 
+// FormatFlags renders a []Flag slice as a compact, one-per-line prompt string.
+// E.g.: "  --follow (-f): Follow log output"
+// This is used in retry prompts to give the model an authoritative flag list
+// without the ambiguity of raw --help output (continuation lines, examples, etc.).
+func FormatFlags(flags []Flag) string {
+	if len(flags) == 0 {
+		return ""
+	}
+	var lines []string
+	for _, f := range flags {
+		var line string
+		if f.Short != "" {
+			line = fmt.Sprintf("  --%s (-%s): %s", f.Name, f.Short, f.Description)
+		} else {
+			line = fmt.Sprintf("  --%s: %s", f.Name, f.Description)
+		}
+		lines = append(lines, line)
+	}
+	result := strings.Join(lines, "\n")
+	// Cap at ~600 chars to stay comfortably within the token budget.
+	if len(result) > 600 {
+		result = result[:600] + "\n  [...]"
+	}
+	return result
+}
+
 // compressHelpText trims a --help output to a compact, token-efficient form.
 // Keeps flag names and one-line descriptions, strips usage examples and padding.
 func compressHelpText(text string) string {

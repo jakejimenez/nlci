@@ -2,10 +2,26 @@ package validator
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/jakejimenez/nlci/internal/definition"
 )
+
+// placeholderREs is a list of compiled regular expressions that identify
+// template/placeholder tokens the model should never emit.  Each pattern is
+// checked against the full generated command; a match causes validation failure
+// and triggers a retry with an anti-hallucination reminder.
+var placeholderREs = []*regexp.Regexp{
+	// Angle-bracket tokens: <name>, <your-value>, <OWNER>
+	regexp.MustCompile(`<[^>]+>`),
+	// "your-*" tokens (e.g. your-repo, your-branch, your-image-name)
+	regexp.MustCompile(`\byour-\S+`),
+	// ALL-CAPS/ALL-CAPS owner/repo style (e.g. OWNER/REPO, USER/REPO)
+	regexp.MustCompile(`\b[A-Z]{2,}/[A-Z]{2,}\b`),
+	// Square-bracket tokens: [name], [value]
+	regexp.MustCompile(`\[[^\]]+\]`),
+}
 
 // Result is the output of a validation check.
 type Result struct {
@@ -31,7 +47,15 @@ func Validate(command string, def *definition.CLIDefinition) Result {
 		}
 	}
 
-	// 2. Check against forbidden patterns, anchored to word boundaries.
+	// 2. Reject placeholder tokens — the model should never emit template values
+	//    such as <name>, your-repo-url, OWNER/REPO, or [value].
+	if token := findPlaceholder(command); token != "" {
+		return Result{
+			Error: fmt.Sprintf("command contains a placeholder token %q — use a real value instead", token),
+		}
+	}
+
+	// 3. Check against forbidden patterns, anchored to word boundaries.
 	for _, forbidden := range def.Safety.Forbidden {
 		if containsAtBoundary(command, forbidden) {
 			return Result{
@@ -40,7 +64,7 @@ func Validate(command string, def *definition.CLIDefinition) Result {
 		}
 	}
 
-	// 3. Check whether this command requires confirmation before execution.
+	// 4. Check whether this command requires confirmation before execution.
 	requiresConfirm := false
 	for _, pattern := range def.Safety.RequireConfirmation {
 		if containsAtBoundary(command, pattern) {
@@ -53,6 +77,17 @@ func Validate(command string, def *definition.CLIDefinition) Result {
 		Valid:                true,
 		RequiresConfirmation: requiresConfirm,
 	}
+}
+
+// findPlaceholder returns the first placeholder token found in command,
+// or an empty string if none are present.
+func findPlaceholder(command string) string {
+	for _, re := range placeholderREs {
+		if m := re.FindString(command); m != "" {
+			return m
+		}
+	}
+	return ""
 }
 
 // containsAtBoundary reports whether command contains pattern such that the
