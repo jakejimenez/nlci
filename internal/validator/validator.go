@@ -27,6 +27,18 @@ var placeholderREs = []*regexp.Regexp{
 	regexp.MustCompile(`\[[^\]]+\]`),
 }
 
+// hallucinationREs match concrete-looking identifiers in a generated command
+// that, if not present in the user's intent, are very likely hallucinated from
+// a few-shot example. URLs and long digit runs (≥4 digits) are the two strong
+// signals — paths and short numbers have too many false positives. Each match
+// is cross-checked against the user's intent in findHallucinatedIdentifier.
+var hallucinationREs = []*regexp.Regexp{
+	// URLs: http://… or https://…, captured up to the next whitespace or quote.
+	regexp.MustCompile(`https?://[^\s"']+`),
+	// Long digit runs as standalone tokens (≥4 consecutive digits).
+	regexp.MustCompile(`\b\d{4,}\b`),
+}
+
 // Result is the output of a validation check.
 type Result struct {
 	Valid                bool
@@ -34,8 +46,11 @@ type Result struct {
 	Error                string
 }
 
-// Validate checks a generated command against the CLI definition rules.
-func Validate(command string, def *definition.CLIDefinition) Result {
+// Validate checks a generated command against the CLI definition rules. The
+// `intent` is the user's original natural-language input; it is consulted only
+// by the hallucination check (step 2b) to decide whether concrete identifiers
+// in the command were actually requested by the user.
+func Validate(command, intent string, def *definition.CLIDefinition) Result {
 	command = strings.TrimSpace(command)
 
 	if command == "" {
@@ -56,6 +71,15 @@ func Validate(command string, def *definition.CLIDefinition) Result {
 	if token := findPlaceholder(command); token != "" {
 		return Result{
 			Error: fmt.Sprintf("command contains a placeholder token %q — use a real value instead", token),
+		}
+	}
+
+	// 2b. Reject concrete identifiers in the command that don't appear in the
+	//     intent. URLs and long digit runs are reliable hallucination signals
+	//     — typically copied verbatim from a scaffold few-shot example.
+	if id := findHallucinatedIdentifier(command, intent); id != "" {
+		return Result{
+			Error: fmt.Sprintf("command contains %q which was not in your intent — the model likely copied it from an example; use the user's actual value", id),
 		}
 	}
 
@@ -97,6 +121,25 @@ func findPlaceholder(command string) string {
 	for _, re := range placeholderREs {
 		if m := re.FindString(command); m != "" {
 			return m
+		}
+	}
+	return ""
+}
+
+// findHallucinatedIdentifier returns the first URL or long-digit-run in the
+// command that does not appear (case-insensitively) in the user's intent. An
+// empty intent skips the check (defensive — keeps the validator usable in SDK
+// paths that don't supply one).
+func findHallucinatedIdentifier(command, intent string) string {
+	if intent == "" {
+		return ""
+	}
+	intentLower := strings.ToLower(intent)
+	for _, re := range hallucinationREs {
+		for _, m := range re.FindAllString(command, -1) {
+			if !strings.Contains(intentLower, strings.ToLower(m)) {
+				return m
+			}
 		}
 	}
 	return ""

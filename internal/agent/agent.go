@@ -146,7 +146,7 @@ func (a *Agent) runLoop(ctx context.Context, intent string, candidates []retriev
 	command := strings.TrimSpace(resp.Command)
 
 	// Validate.
-	v := validator.Validate(command, a.def)
+	v := validator.Validate(command, intent, a.def)
 	if !v.Valid {
 		nextError := buildErrorContext(command, v.Error, candidates, a.def.Binary, attempt+1)
 		return a.runLoop(ctx, intent, candidates, nextError, attempt+1)
