@@ -8,11 +8,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/exec"
+	"regexp"
 	"strings"
 
 	"github.com/jakejimenez/nlci/internal/backend"
 	"github.com/jakejimenez/nlci/internal/definition"
 )
+
+// otherBinaryRe restricts OTHER: <name> answers to plausible CLI binary names
+// — same character class deterministic discovery uses for command parts.
+var otherBinaryRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]*$`)
 
 // ToolMeta is the minimal metadata the router needs about a tool. Built from
 // definition.AvailableTool via MetasFromAvailable.
@@ -43,10 +49,11 @@ func MetasFromAvailable(in []definition.AvailableTool) []ToolMeta {
 	return out
 }
 
-// Route asks the LLM to pick a tool from `tools` for the given intent. The
-// returned name is guaranteed to appear in `tools`. On the first invalid
-// answer the prompt is retried once with an explicit "choose from" hint;
-// after that it returns ErrInvalidChoice.
+// Route asks the LLM to pick a tool for the given intent. The returned name
+// is either an entry from `tools` or — when the model answers `OTHER: <bin>`
+// — a binary verified to exist on PATH so callers can chain into auto-init.
+// The prompt is retried once when the answer is unparseable; after that it
+// returns ErrInvalidChoice.
 func Route(ctx context.Context, intent string, tools []ToolMeta, br *backend.Router) (string, error) {
 	if len(tools) == 0 {
 		return "", ErrNoTools
@@ -54,36 +61,79 @@ func Route(ctx context.Context, intent string, tools []ToolMeta, br *backend.Rou
 
 	names := toolNameSet(tools)
 
-	system, user := buildRoutingPrompt(tools, intent, "")
-	resp, err := br.Generate(ctx, backend.Request{System: system, Intent: user})
-	if err != nil {
-		return "", err
+	resolve := func(retryHint string) (string, error) {
+		system, user := buildRoutingPrompt(tools, intent, retryHint)
+		resp, err := br.Generate(ctx, backend.Request{System: system, Intent: user})
+		if err != nil {
+			return "", err
+		}
+		ch := parseChoice(resp.Command)
+		// Explicit escape hatch: model used `OTHER: <binary>`.
+		if ch.other {
+			if !otherBinaryRe.MatchString(ch.name) {
+				return "", fmt.Errorf("%w (got OTHER:%q which is not a valid binary name)", ErrInvalidChoice, ch.name)
+			}
+			if _, err := exec.LookPath(ch.name); err != nil {
+				return "", fmt.Errorf("router: model suggested %q via OTHER but it is not installed on PATH", ch.name)
+			}
+			return ch.name, nil
+		}
+		// Listed tool — accept directly.
+		if names[ch.name] {
+			return ch.name, nil
+		}
+		// Implicit escape hatch: model returned a plain name not in the list.
+		// If it parses as a real binary on PATH, treat it the same as OTHER.
+		// Apple Intelligence frequently ignores the OTHER prefix instruction,
+		// and forcing a retry rarely fixes that — be lenient when we can
+		// safely verify the binary exists, otherwise fall through to retry.
+		if otherBinaryRe.MatchString(ch.name) {
+			if _, err := exec.LookPath(ch.name); err == nil {
+				return ch.name, nil
+			}
+		}
+		return "", invalidListChoice{got: ch.name}
 	}
-	choice := normalizeChoice(resp.Command)
-	if names[choice] {
-		return choice, nil
+
+	if name, err := resolve(""); err == nil {
+		return name, nil
+	} else if _, ok := err.(invalidListChoice); !ok {
+		return "", err
 	}
 
 	hint := fmt.Sprintf(
-		"Your previous answer %q was not in the list. Choose exactly one of: %s.",
-		choice, strings.Join(toolNames(tools), ", "),
+		"Your previous answer was not valid. Choose exactly one of: %s — or output OTHER: <binary> for a CLI not in the list.",
+		strings.Join(toolNames(tools), ", "),
 	)
-	system, user = buildRoutingPrompt(tools, intent, hint)
-	resp, err = br.Generate(ctx, backend.Request{System: system, Intent: user})
-	if err != nil {
+	if name, err := resolve(hint); err == nil {
+		return name, nil
+	} else if invalid, ok := err.(invalidListChoice); ok {
+		return "", fmt.Errorf("%w (got %q; available: %s)", ErrInvalidChoice, invalid.got, strings.Join(toolNames(tools), ", "))
+	} else {
 		return "", err
 	}
-	choice = normalizeChoice(resp.Command)
-	if names[choice] {
-		return choice, nil
-	}
-	return "", fmt.Errorf("%w (got %q; available: %s)", ErrInvalidChoice, choice, strings.Join(toolNames(tools), ", "))
 }
 
-// normalizeChoice extracts a clean tool name from raw model output.
-// Strategy: take the first non-empty line, lowercase it, strip backticks,
-// quotes, leading dashes/asterisks, and trailing punctuation/whitespace.
-func normalizeChoice(raw string) string {
+// invalidListChoice is an internal sentinel signaling the model returned a
+// plain name that is not in the available list (and is not an OTHER: answer).
+// Used to drive a single retry; never escapes the package.
+type invalidListChoice struct{ got string }
+
+func (e invalidListChoice) Error() string { return "router: invalid list choice: " + e.got }
+
+// choice is the parsed model answer. `other` true means the model invoked
+// the escape hatch and `name` is the requested binary; otherwise `name` is
+// expected to be one of the listed tools.
+type choice struct {
+	name  string
+	other bool
+}
+
+// parseChoice extracts a clean answer from raw model output. Strategy: take
+// the first non-empty line, lowercase it, strip backticks/quotes/leading
+// markdown bullets and trailing punctuation. If the line begins with
+// `other:`, return the rest as an escape-hatch binary name.
+func parseChoice(raw string) choice {
 	for _, line := range strings.Split(raw, "\n") {
 		line = strings.TrimSpace(line)
 		line = strings.Trim(line, "`\"'")
@@ -93,15 +143,23 @@ func normalizeChoice(raw string) string {
 		if line == "" {
 			continue
 		}
-		// Take only the first whitespace-delimited token in case the model
-		// added a trailing description ("docker — for containers").
-		fields := strings.Fields(line)
+		lower := strings.ToLower(line)
+		if rest, ok := strings.CutPrefix(lower, "other:"); ok {
+			rest = strings.TrimSpace(rest)
+			rest = strings.Trim(rest, "`\"'")
+			fields := strings.Fields(rest)
+			if len(fields) == 0 {
+				return choice{}
+			}
+			return choice{name: strings.TrimRight(fields[0], ".,;:"), other: true}
+		}
+		fields := strings.Fields(lower)
 		if len(fields) == 0 {
 			continue
 		}
-		return strings.TrimRight(strings.ToLower(fields[0]), ".,;:")
+		return choice{name: strings.TrimRight(fields[0], ".,;:")}
 	}
-	return ""
+	return choice{}
 }
 
 func toolNames(tools []ToolMeta) []string {
