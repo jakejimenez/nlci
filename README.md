@@ -2,6 +2,8 @@
 
 Natural language interface layer for any CLI tool. Drop a YAML file, get `nlci docker "clean up stopped containers"`. Powered by Apple Intelligence or llama.cpp — no cloud, no API keys.
 
+![nlci demo](assets/demo.gif)
+
 ```
 nlci docker "clean up stopped containers"
 
