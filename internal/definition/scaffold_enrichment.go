@@ -218,13 +218,7 @@ func generateCommandExamples(toolName string, cmd Command, family, kind string) 
 			add("show details", base)
 		}
 	case "search":
-		query := "sample"
-		if kind == "package" {
-			query = "json"
-			add("search for json tools", joinParts(toolName, cmd.Name, query))
-		} else {
-			add("search for "+query, joinParts(toolName, cmd.Name, query))
-		}
+		add("search for <query>", joinParts(toolName, cmd.Name, "<query>"))
 	case "install":
 		add("install "+value, joinParts(toolName, cmd.Name, value))
 	case "remove":
@@ -252,7 +246,7 @@ func generateCommandExamples(toolName string, cmd Command, family, kind string) 
 	case "check":
 		switch kind {
 		case "pr":
-			add("check the status of CI checks on PR 42", joinParts(toolName, cmd.Name, sampleValueForFamilyAndKind(family, kind)))
+			add("check the status of CI checks on PR <id>", joinParts(toolName, cmd.Name, sampleValueForFamilyAndKind(family, kind)))
 		default:
 			add("check "+toolPhrases[0]+" for issues", base)
 		}
@@ -285,9 +279,9 @@ func generateCommandExamples(toolName string, cmd Command, family, kind string) 
 	case "exec":
 		add("run a command in "+value, joinParts(toolName, cmd.Name, value))
 	case "download":
-		add("download https://example.com", joinParts(toolName, cmd.Name, sampleValueForFamilyAndKind(family, "url")))
+		add("download <url>", joinParts(toolName, cmd.Name, sampleValueForFamilyAndKind(family, "url")))
 	case "upload":
-		add("upload "+sampleValueForFamilyAndKind(family, "file"), joinParts(toolName, cmd.Name, sampleValueForFamilyAndKind(family, "file")))
+		add("upload <file>", joinParts(toolName, cmd.Name, sampleValueForFamilyAndKind(family, "file")))
 	}
 
 	if len(examples) > 2 {
@@ -326,46 +320,51 @@ func generateCapabilityExamples(toolName string, cap Capability, flags map[strin
 
 	switch cap.Name {
 	case "request":
+		// GET first so the model has a flagless template to copy when the
+		// user's intent doesn't ask for a body. Without this, the only
+		// request-capability example is the JSON POST below, and the model
+		// often emits --json even when the intent says "GET".
+		add("send a GET request to <url>", joinParts(toolName, "<url>"))
 		if has("json") {
-			add("send JSON post to https://api.example.com", joinParts(toolName, flagRef("json"), `'{"key":"value"}'`, "https://api.example.com"))
+			add("send a JSON POST to <url>", joinParts(toolName, flagRef("json"), "<json>", "<url>"))
 		} else if has("data") {
-			add("send form data to https://api.example.com", joinParts(toolName, flagRef("data"), "key=value", "https://api.example.com"))
+			add("send form data to <url>", joinParts(toolName, flagRef("data"), "<data>", "<url>"))
 		}
 	case "headers":
 		if has("head") {
-			add("fetch only headers for https://example.com", joinParts(toolName, flagRef("head"), "https://example.com"))
+			add("fetch only headers for <url>", joinParts(toolName, flagRef("head"), "<url>"))
 		}
 		if has("header") {
-			add("send a custom header to https://api.example.com", joinParts(toolName, flagRef("header"), "X-Trace: true", "https://api.example.com"))
+			add("send a custom header to <url>", joinParts(toolName, flagRef("header"), "<header>", "<url>"))
 		}
 	case "auth":
 		if has("user") {
-			add("use basic auth for https://example.com", joinParts(toolName, flagRef("user"), "user:pass", "https://example.com"))
+			add("use basic auth for <url>", joinParts(toolName, flagRef("user"), "<user:pass>", "<url>"))
 		}
 	case "output":
 		if has("output") {
-			add("save https://example.com to index.html", joinParts(toolName, flagRef("output"), "index.html", "https://example.com"))
+			add("save <url> to <file>", joinParts(toolName, flagRef("output"), "<file>", "<url>"))
 		}
 	case "redirects":
 		if has("location") {
-			add("follow redirects for https://example.com", joinParts(toolName, flagRef("location"), "https://example.com"))
+			add("follow redirects for <url>", joinParts(toolName, flagRef("location"), "<url>"))
 		}
 	case "transfer":
-		add("download https://example.com", joinParts(toolName, "https://example.com"))
+		add("download <url>", joinParts(toolName, "<url>"))
 		if has("upload-file") {
-			add("upload upload.txt to https://example.com", joinParts(toolName, flagRef("upload-file"), "upload.txt", "https://example.com"))
+			add("upload <file> to <url>", joinParts(toolName, flagRef("upload-file"), "<file>", "<url>"))
 		}
 	case "proxy":
 		if has("proxy") {
-			add("download https://example.com through a proxy", joinParts(toolName, flagRef("proxy"), "http://localhost:8080", "https://example.com"))
+			add("download <url> through a proxy", joinParts(toolName, flagRef("proxy"), "<host>", "<url>"))
 		}
 	case "tls":
 		if has("insecure") {
-			add("download https://example.com without verifying TLS", joinParts(toolName, flagRef("insecure"), "https://example.com"))
+			add("download <url> without verifying TLS", joinParts(toolName, flagRef("insecure"), "<url>"))
 		}
 	case "debugging":
 		if has("verbose") {
-			add("show verbose output for https://example.com", joinParts(toolName, flagRef("verbose"), "https://example.com"))
+			add("show verbose output for <url>", joinParts(toolName, flagRef("verbose"), "<url>"))
 		}
 	}
 
@@ -483,49 +482,42 @@ func extractProperNoun(desc string) string {
 	return ""
 }
 
+// sampleValueForFamilyAndKind returns a bracketed placeholder for the given
+// kind. Placeholders signal "user value goes here" to the model and are
+// already rejected by the validator's `placeholderREs` if copied verbatim,
+// which forces the agentic retry loop to substitute the user's actual value.
 func sampleValueForFamilyAndKind(family, kind string) string {
 	switch kind {
 	case "package":
-		switch family {
-		case "install":
-			return "ripgrep"
-		case "remove":
-			return "wget"
-		case "info":
-			return "ffmpeg"
-		case "upgrade":
-			return "node"
-		default:
-			return "ripgrep"
-		}
+		return "<package>"
 	case "service":
-		return "postgresql"
+		return "<service>"
 	case "image":
-		return "nginx"
+		return "<image>"
 	case "container":
-		return "web"
+		return "<container>"
 	case "repo":
-		return "owner/repo"
+		return "<owner/repo>"
 	case "pr", "issue":
-		return "42"
+		return "<id>"
 	case "workflow":
-		return "987654321"
+		return "<id>"
 	case "branch":
-		return "main"
+		return "<branch>"
 	case "release":
-		return "v1.0.0"
+		return "<version>"
 	case "file":
-		return "index.html"
+		return "<file>"
 	case "url":
-		return "https://example.com"
+		return "<url>"
 	default:
 		if family == "download" {
-			return "https://example.com"
+			return "<url>"
 		}
 		if family == "upload" {
-			return "upload.txt"
+			return "<file>"
 		}
-		return "sample"
+		return "<value>"
 	}
 }
 
