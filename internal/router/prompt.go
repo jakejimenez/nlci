@@ -7,13 +7,15 @@ import (
 	"github.com/jakejimenez/nlci/internal/prompt"
 )
 
-const routingInstructions = `You are a tool router. Given a user intent, pick the single best CLI tool from the list below to fulfill it.
+const routingInstructions = `You are a tool router. Given a user intent, pick the single best CLI tool to fulfill it.
 
 Rules:
 - Output ONLY the tool name, lowercase, on a single line.
 - No explanation, no markdown, no quotes.
-- The name MUST be one from the list. Do not invent names.
-- Prefer the tool whose name, description, or synonyms most directly match.`
+- Prefer a tool from the list below — its name, description, or synonyms.
+- If NO listed tool fits the intent, output exactly: OTHER: <binary>
+  where <binary> is a real CLI program (e.g., OTHER: curl, OTHER: kubectl).
+  Use OTHER only when no listed tool is appropriate.`
 
 // buildRoutingPrompt assembles the system and user prompts. If the resulting
 // pair would exceed prompt.SafeTokenCeiling, metadata is dropped progressively
