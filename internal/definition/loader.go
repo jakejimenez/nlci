@@ -59,6 +59,28 @@ func Load(toolName string, userPaths []string) (*CLIDefinition, error) {
 	return enrich(def)
 }
 
+// IsCurated reports whether toolName has a curated definition reachable from
+// the same search path Load uses (cwd, user paths, or bundled). It returns
+// false when only the zero-config fallback in Load would apply. Filesystem-
+// only — does not parse YAML, so a broken-but-existing user file still counts
+// as curated and won't be silently overwritten by auto-init.
+func IsCurated(toolName string, userPaths []string) bool {
+	filename := toolName + ".nlci.yaml"
+	if _, err := os.Stat(filename); err == nil {
+		return true
+	}
+	for _, dir := range userPaths {
+		if _, err := os.Stat(filepath.Join(dir, filename)); err == nil {
+			return true
+		}
+	}
+	if f, err := bundledFS.Open("bundled/" + filename); err == nil {
+		_ = f.Close()
+		return true
+	}
+	return false
+}
+
 // LoadFile loads a CLIDefinition from an explicit file path.
 func LoadFile(path string) (*CLIDefinition, error) {
 	def, err := loadFile(path)
