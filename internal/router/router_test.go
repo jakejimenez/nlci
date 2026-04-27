@@ -98,6 +98,112 @@ func TestRoute_RetryOnInvalid(t *testing.T) {
 	if !strings.Contains(stub.lastReq.Intent, "previous answer") {
 		t.Fatalf("retry user prompt missing hint: %q", stub.lastReq.Intent)
 	}
+	// And must mention OTHER as an option.
+	if !strings.Contains(stub.lastReq.Intent, "OTHER") {
+		t.Fatalf("retry hint should mention OTHER escape hatch: %q", stub.lastReq.Intent)
+	}
+}
+
+func TestRoute_OtherEscapeHatch(t *testing.T) {
+	// A binary that almost certainly exists on any host running these tests.
+	stub := &stubBackend{name: "stub", responses: []string{"OTHER: ls"}}
+	got, err := Route(context.Background(), "list directory entries", makeTools(), newRouter(stub))
+	if err != nil {
+		t.Fatalf("Route: %v", err)
+	}
+	if got != "ls" {
+		t.Fatalf("want ls, got %q", got)
+	}
+	if stub.calls != 1 {
+		t.Fatalf("expected 1 call (no retry), got %d", stub.calls)
+	}
+}
+
+func TestRoute_OtherWithMissingBinary(t *testing.T) {
+	stub := &stubBackend{name: "stub", responses: []string{"OTHER: definitely-not-real"}}
+	_, err := Route(context.Background(), "x", makeTools(), newRouter(stub))
+	if err == nil {
+		t.Fatalf("expected error for missing OTHER binary")
+	}
+	if !strings.Contains(err.Error(), "not installed on PATH") {
+		t.Fatalf("error should mention PATH: %v", err)
+	}
+}
+
+func TestRoute_OtherWithGarbageName(t *testing.T) {
+	stub := &stubBackend{name: "stub", responses: []string{"OTHER: ../etc/passwd"}}
+	_, err := Route(context.Background(), "x", makeTools(), newRouter(stub))
+	if !errors.Is(err, ErrInvalidChoice) {
+		t.Fatalf("want ErrInvalidChoice for invalid OTHER name, got %v", err)
+	}
+}
+
+func TestRoute_ImplicitOtherFallback(t *testing.T) {
+	// Model returns a plain name not in the list, but it resolves on PATH.
+	// Should be accepted without OTHER prefix (Apple Intelligence often
+	// ignores the prefix instruction).
+	stub := &stubBackend{name: "stub", responses: []string{"ls"}}
+	got, err := Route(context.Background(), "list directory", makeTools(), newRouter(stub))
+	if err != nil {
+		t.Fatalf("Route: %v", err)
+	}
+	if got != "ls" {
+		t.Fatalf("want ls, got %q", got)
+	}
+	if stub.calls != 1 {
+		t.Fatalf("expected 1 call (no retry), got %d", stub.calls)
+	}
+}
+
+func TestRoute_PlainNameNotOnPath_RetriesAndFails(t *testing.T) {
+	// Model returns a plain name that's neither in the list nor on PATH.
+	// Should retry once, fail with ErrInvalidChoice on second invalid answer.
+	stub := &stubBackend{name: "stub", responses: []string{"definitely-not-real-1", "definitely-not-real-2"}}
+	_, err := Route(context.Background(), "x", makeTools(), newRouter(stub))
+	if !errors.Is(err, ErrInvalidChoice) {
+		t.Fatalf("want ErrInvalidChoice, got %v", err)
+	}
+	if stub.calls != 2 {
+		t.Fatalf("expected 2 calls (retry), got %d", stub.calls)
+	}
+}
+
+func TestRoute_OtherOnRetry(t *testing.T) {
+	// First answer is invalid; retry uses OTHER successfully.
+	stub := &stubBackend{name: "stub", responses: []string{"unknown", "OTHER: ls"}}
+	got, err := Route(context.Background(), "x", makeTools(), newRouter(stub))
+	if err != nil {
+		t.Fatalf("Route: %v", err)
+	}
+	if got != "ls" {
+		t.Fatalf("want ls, got %q", got)
+	}
+	if stub.calls != 2 {
+		t.Fatalf("expected 2 calls, got %d", stub.calls)
+	}
+}
+
+func TestParseChoice(t *testing.T) {
+	cases := []struct {
+		raw   string
+		name  string
+		other bool
+	}{
+		{"docker", "docker", false},
+		{"OTHER: curl", "curl", true},
+		{"other:curl", "curl", true},
+		{"  OTHER:  kubectl  ", "kubectl", true},
+		{"`OTHER: jq`", "jq", true},
+		{"- OTHER: brew", "brew", true},
+		{"OTHER: curl — for HTTP", "curl", true},
+		{"", "", false},
+	}
+	for _, tc := range cases {
+		got := parseChoice(tc.raw)
+		if got.name != tc.name || got.other != tc.other {
+			t.Fatalf("parseChoice(%q): want {%q, %v}, got {%q, %v}", tc.raw, tc.name, tc.other, got.name, got.other)
+		}
+	}
 }
 
 func TestRoute_InvalidAfterRetry(t *testing.T) {
