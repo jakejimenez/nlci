@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -16,6 +18,7 @@ import (
 	"github.com/jakejimenez/nlci/internal/agent"
 	"github.com/jakejimenez/nlci/internal/backend"
 	"github.com/jakejimenez/nlci/internal/definition"
+	"github.com/jakejimenez/nlci/internal/router"
 )
 
 var (
@@ -45,19 +48,7 @@ Examples:
 		// to this RunE instead of erroring.
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if len(args) < 1 {
-				return cmd.Help()
-			}
-			toolName := args[0]
-			// Join remaining args so unquoted multi-word intents work:
-			//   nlci docker show me running containers
-			// is equivalent to:
-			//   nlci docker "show me running containers"
-			if len(args) < 2 {
-				return cmd.Help()
-			}
-			intent := strings.Join(args[1:], " ")
-			return runTool(cmd.Context(), toolName, intent)
+			return dispatch(cmd, args)
 		},
 		// Silence usage on runtime errors — don't print full help on inference failure
 		SilenceUsage: true,
@@ -69,12 +60,122 @@ Examples:
 
 	root.AddCommand(
 		newInitCmd(),
+		newAskCmd(),
 		newConfigCmd(),
 	)
 
 	if err := root.ExecuteContext(ctx); err != nil {
 		os.Exit(1)
 	}
+}
+
+// dispatch decides which mode an invocation falls into:
+//
+//   - help: no args, or bare tool name with no intent
+//   - routing: first arg is not a known tool/binary, or single arg has whitespace
+//   - classic with auto-init: first arg is a known tool or installed binary
+//
+// The "is it a binary?" check (exec.LookPath) disambiguates unquoted multi-
+// word intents (e.g., `nlci show me my containers` → routing) from classic
+// dispatch (e.g., `nlci docker ps`) without forcing the user to quote.
+func dispatch(cmd *cobra.Command, args []string) error {
+	ctx := cmd.Context()
+	if len(args) == 0 {
+		return cmd.Help()
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+
+	if len(args) == 1 {
+		single := args[0]
+		if strings.ContainsAny(single, " \t") {
+			return runRouted(ctx, cfg, single)
+		}
+		if isKnownTool(single, cfg) {
+			// Bare tool name with no intent — show help.
+			return cmd.Help()
+		}
+		// Single-word natural-language intent (e.g., `nlci status`).
+		return runRouted(ctx, cfg, single)
+	}
+
+	// len(args) >= 2
+	first := args[0]
+	if isKnownTool(first, cfg) {
+		intent := strings.Join(args[1:], " ")
+		return runToolWithAutoInit(ctx, cfg, first, intent)
+	}
+	// First arg is neither a curated tool nor a binary in PATH — treat the
+	// whole thing as a natural-language intent (e.g., `nlci show me my pull
+	// requests`).
+	return runRouted(ctx, cfg, strings.Join(args, " "))
+}
+
+// looksLikeRoutingIntent reports whether dispatch would send args to the
+// router. Pure helper, broken out for table-testing.
+func looksLikeRoutingIntent(args []string, knownTool func(string) bool) bool {
+	if len(args) == 0 {
+		return false
+	}
+	if len(args) == 1 {
+		if strings.ContainsAny(args[0], " \t") {
+			return true
+		}
+		return !knownTool(args[0])
+	}
+	return !knownTool(args[0])
+}
+
+// isKnownTool returns true if name is a curated tool definition or a binary
+// found on PATH. Both signal "user means this as a tool name."
+func isKnownTool(name string, cfg config.Config) bool {
+	if definition.IsCurated(name, cfg.Definitions.Paths) {
+		return true
+	}
+	if _, err := exec.LookPath(name); err == nil {
+		return true
+	}
+	return false
+}
+
+// runToolWithAutoInit ensures a curated definition exists for toolName,
+// scaffolding one into the user config dir if not, then runs the normal
+// translation pipeline.
+func runToolWithAutoInit(ctx context.Context, cfg config.Config, toolName, intent string) error {
+	if !definition.IsCurated(toolName, cfg.Definitions.Paths) {
+		if err := autoInit(ctx, cfg, toolName); err != nil {
+			return err
+		}
+	}
+	return runTool(ctx, toolName, intent)
+}
+
+// runRouted asks the LLM to pick a tool for the given intent, then dispatches
+// through the auto-init path so a routed-to-uncurated tool gets scaffolded
+// transparently.
+func runRouted(ctx context.Context, cfg config.Config, intent string) error {
+	tools, err := definition.ListAvailableTools(cfg.Definitions.Paths)
+	if err != nil {
+		return err
+	}
+	if len(tools) == 0 {
+		return fmt.Errorf("nlci: no tool definitions available — run `nlci init <tool>` to scaffold one, or invoke a tool directly: nlci <tool> \"<intent>\"")
+	}
+
+	br := buildBackendRouter(cfg, flagBackend)
+	metas := router.MetasFromAvailable(tools)
+
+	fmt.Fprintln(os.Stderr, "Routing intent to a tool…")
+	toolName, err := router.Route(ctx, intent, metas, br)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "→ %s\n", toolName)
+
+	return runToolWithAutoInit(ctx, cfg, toolName, intent)
 }
 
 func runTool(ctx context.Context, toolName, intent string) error {
@@ -100,6 +201,74 @@ func runTool(ctx context.Context, toolName, intent string) error {
 	return err
 }
 
+// newAskCmd is the explicit routing entry point. Useful for scripts that want
+// to bypass the implicit-routing heuristic, or for single-word intents where
+// the heuristic would treat the word as a tool name.
+func newAskCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "ask <intent...>",
+		Short:        "Route a natural-language intent to a tool and run it",
+		Args:         cobra.MinimumNArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+			return runRouted(cmd.Context(), cfg, strings.Join(args, " "))
+		},
+	}
+}
+
+// autoInit scaffolds a definition into the user config dir for an uncurated
+// tool. Silent except for one stderr line at start and one at completion.
+// Errors out cleanly if the tool binary isn't on PATH.
+func autoInit(ctx context.Context, cfg config.Config, toolName string) error {
+	if _, err := exec.LookPath(toolName); err != nil {
+		return fmt.Errorf("nlci: %q is not installed (not found in PATH).\n  Install it first, or run `nlci init %s` after installing.", toolName, toolName)
+	}
+
+	targetDir, err := autoInitTargetDir(cfg)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		return fmt.Errorf("nlci: could not create %s: %w", targetDir, err)
+	}
+
+	fmt.Fprintf(os.Stderr, "First time using %s — generating definition…\n", toolName)
+
+	br := buildBackendRouter(cfg, flagBackend)
+	initCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	path, err := scaffoldDefinition(initCtx, toolName, scaffoldOptions{
+		TargetDir:     targetDir,
+		Quiet:         true,
+		BackendRouter: br,
+	})
+	if err != nil {
+		return fmt.Errorf("nlci: auto-init failed for %q: %w", toolName, err)
+	}
+	fmt.Fprintf(os.Stderr, "Saved definition to %s\n", path)
+	return nil
+}
+
+// autoInitTargetDir picks the destination for a scaffolded definition: the
+// first user-configured definitions path, or ~/.config/nlci/definitions/.
+func autoInitTargetDir(cfg config.Config) (string, error) {
+	for _, p := range cfg.Definitions.Paths {
+		if p != "" {
+			return p, nil
+		}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("nlci: could not resolve home directory: %w", err)
+	}
+	return filepath.Join(home, ".config", "nlci", "definitions"), nil
+}
+
 // newInitCmd scaffolds a *.nlci.yaml from a tool's --help output.
 func newInitCmd() *cobra.Command {
 	return &cobra.Command{
@@ -113,19 +282,42 @@ func newInitCmd() *cobra.Command {
 	}
 }
 
+// scaffoldOptions controls scaffold generation. TargetDir == "" writes to cwd
+// (matching the original `nlci init` behavior); a non-empty value writes there
+// (used by auto-init to persist into the user config dir). Quiet suppresses
+// stdout chatter — callers like auto-init emit a single stderr line instead.
+// BackendRouter is reused when supplied so auto-init doesn't re-resolve the
+// backend a second time.
+type scaffoldOptions struct {
+	TargetDir     string
+	Quiet         bool
+	BackendRouter *backend.Router
+}
+
 func runInit(ctx context.Context, toolName string) error {
-	fmt.Printf("Discovering %s --help...\n", toolName)
+	_, err := scaffoldDefinition(ctx, toolName, scaffoldOptions{TargetDir: "", Quiet: false})
+	return err
+}
 
-	filename := toolName + ".nlci.yaml"
+// scaffoldDefinition is the shared core behind both `nlci init` and auto-init.
+// It runs deterministic discovery, falls back to flag-driven mode when weak,
+// optionally runs inference-assisted probing, and writes the resulting YAML
+// scaffold. Returns the path of the file written.
+func scaffoldDefinition(ctx context.Context, toolName string, opts scaffoldOptions) (string, error) {
+	if !opts.Quiet {
+		fmt.Printf("Discovering %s --help...\n", toolName)
+	}
 
-	// Don't overwrite an existing definition
+	filename := filepath.Join(opts.TargetDir, toolName+".nlci.yaml")
+
+	// Don't overwrite an existing definition.
 	if _, err := os.Stat(filename); err == nil {
-		return fmt.Errorf("init: %s already exists — delete it first to re-scaffold", filename)
+		return "", fmt.Errorf("init: %s already exists — delete it first to re-scaffold", filename)
 	}
 
 	result, err := definition.DiscoverDetailed(toolName)
 	if err != nil {
-		return fmt.Errorf("init: could not discover %q: %w", toolName, err)
+		return "", fmt.Errorf("init: could not discover %q: %w", toolName, err)
 	}
 
 	mode := "command_tree"
@@ -136,28 +328,37 @@ func runInit(ctx context.Context, toolName string) error {
 			enrichedFlagResult, synonyms := definition.EnrichFlagDrivenScaffold(toolName, flagResult)
 			mode = "flag_driven"
 			if err := writeFlagDrivenScaffold(filename, toolName, enrichedFlagResult, synonyms); err != nil {
-				return err
+				return "", err
 			}
-			fmt.Printf("Created %s with %d verified root flags across %d capabilities.\n", filename, len(enrichedFlagResult.RootFlags), len(enrichedFlagResult.Capabilities))
-			fmt.Printf("  Discovery mode: %s\n", mode)
-			fmt.Printf("  Discovery quality: %.1f/100\n", enrichedFlagResult.QualityScore)
-			fmt.Println()
-			fmt.Println("Next steps:")
-			fmt.Printf("  1. Review the generated examples and synonyms in %s\n", filename)
-			fmt.Printf("  2. Write a system_prompt describing the tool\n")
-			fmt.Printf("  3. Run: nlci %s \"<your intent>\" --dry-run\n", toolName)
-			return nil
+			if !opts.Quiet {
+				fmt.Printf("Created %s with %d verified root flags across %d capabilities.\n", filename, len(enrichedFlagResult.RootFlags), len(enrichedFlagResult.Capabilities))
+				fmt.Printf("  Discovery mode: %s\n", mode)
+				fmt.Printf("  Discovery quality: %.1f/100\n", enrichedFlagResult.QualityScore)
+				fmt.Println()
+				fmt.Println("Next steps:")
+				fmt.Printf("  1. Review the generated examples and synonyms in %s\n", filename)
+				fmt.Printf("  2. Write a system_prompt describing the tool\n")
+				fmt.Printf("  3. Run: nlci %s \"<your intent>\" --dry-run\n", toolName)
+			}
+			return filename, nil
 		}
 
-		cfg, cfgErr := config.Load()
-		if cfgErr == nil {
-			fmt.Println("Deterministic discovery is weak; trying inference-assisted probing...")
+		br := opts.BackendRouter
+		if br == nil {
+			if cfg, cfgErr := config.Load(); cfgErr == nil {
+				br = buildBackendRouter(cfg, flagBackend)
+			}
+		}
+		if br != nil {
+			if !opts.Quiet {
+				fmt.Println("Deterministic discovery is weak; trying inference-assisted probing...")
+			}
 			inferCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-			if enriched, count, inferErr := enrichInitDiscovery(inferCtx, cfg, toolName, result); inferErr == nil {
+			if enriched, count, inferErr := enrichInitDiscovery(inferCtx, br, toolName, result); inferErr == nil {
 				result = enriched
 				inferredCount = count
 				quality = definition.AssessDiscoveryQuality(result)
-			} else {
+			} else if !opts.Quiet {
 				fmt.Printf("Inference-assisted probing skipped: %v\n", inferErr)
 			}
 			cancel()
@@ -168,29 +369,32 @@ func runInit(ctx context.Context, toolName string) error {
 	result.Commands = enrichedCommands
 
 	if err := writeScaffold(filename, toolName, result.Commands, generatedSynonyms); err != nil {
-		return err
+		return "", err
 	}
 
-	fmt.Printf("Created %s with %d verified commands.\n", filename, len(result.Commands))
-	if inferredCount > 0 {
-		fmt.Printf("  Inference-assisted probing verified %d additional commands.\n", inferredCount)
+	if !opts.Quiet {
+		fmt.Printf("Created %s with %d verified commands.\n", filename, len(result.Commands))
+		if inferredCount > 0 {
+			fmt.Printf("  Inference-assisted probing verified %d additional commands.\n", inferredCount)
+		}
+		fmt.Printf("  Discovery mode: %s\n", mode)
+		fmt.Printf("  Discovery quality: %.1f/100\n", quality.Score)
+		fmt.Println()
+		fmt.Println("Next steps:")
+		fmt.Printf("  1. Review the generated examples and synonyms in %s\n", filename)
+		fmt.Printf("  2. Write a system_prompt describing the tool\n")
+		fmt.Printf("  3. Run: nlci %s \"<your intent>\" --dry-run\n", toolName)
+	} else if quality.Weak {
+		fmt.Fprintf(os.Stderr, "note: definition for %s is sparse — edit %s to improve it.\n", toolName, filename)
 	}
-	fmt.Printf("  Discovery mode: %s\n", mode)
-	fmt.Printf("  Discovery quality: %.1f/100\n", quality.Score)
-	fmt.Println()
-	fmt.Println("Next steps:")
-	fmt.Printf("  1. Review the generated examples and synonyms in %s\n", filename)
-	fmt.Printf("  2. Write a system_prompt describing the tool\n")
-	fmt.Printf("  3. Run: nlci %s \"<your intent>\" --dry-run\n", toolName)
-	return nil
+	return filename, nil
 }
 
-func enrichInitDiscovery(ctx context.Context, cfg config.Config, toolName string, base *definition.DiscoveryResult) (*definition.DiscoveryResult, int, error) {
+func enrichInitDiscovery(ctx context.Context, br *backend.Router, toolName string, base *definition.DiscoveryResult) (*definition.DiscoveryResult, int, error) {
 	if base == nil {
 		base = &definition.DiscoveryResult{}
 	}
 
-	br := buildBackendRouter(cfg, flagBackend)
 	seedPrompt := buildInitInferencePrompt(toolName, base)
 	resp, err := br.Generate(ctx, backend.Request{
 		System: initInferenceSystemPrompt(toolName),
@@ -498,9 +702,24 @@ func runConfig(ctx context.Context) error {
 	}
 	fmt.Println()
 
-	fmt.Println("Bundled Definitions")
+	fmt.Println("Available Tools")
 	fmt.Println("─────────────────────────────────────")
-	fmt.Println("  docker   gh")
+	tools, err := definition.ListAvailableTools(cfg.Definitions.Paths)
+	if err != nil {
+		return err
+	}
+	if len(tools) == 0 {
+		fmt.Println("  (none — run `nlci init <tool>` to scaffold one)")
+	} else {
+		for _, t := range tools {
+			source := t.Source
+			if t.Description != "" {
+				fmt.Printf("  %-12s  %s  [%s]\n", t.Name, t.Description, source)
+			} else {
+				fmt.Printf("  %-12s  [%s]\n", t.Name, source)
+			}
+		}
+	}
 	return nil
 }
 
