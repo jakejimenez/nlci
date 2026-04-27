@@ -51,6 +51,10 @@ type Config struct {
 
 	// Explain always prints the explanation alongside the command.
 	Explain bool
+
+	// AutoConfirm skips the y/N prompt before executing. Required for
+	// non-interactive callers (CI, scripts) that can't supply stdin input.
+	AutoConfirm bool
 }
 
 // Result is the outcome of a Generate or Run call.
@@ -92,8 +96,9 @@ func New(cfg Config) (*Client, error) {
 	br := buildRouter(appConfig, cfg.Backend)
 
 	agentOpts := agent.Options{
-		DryRun:  cfg.DryRun,
-		Explain: cfg.Explain,
+		DryRun:      cfg.DryRun,
+		Explain:     cfg.Explain,
+		AutoConfirm: cfg.AutoConfirm,
 	}
 	a := agent.New(def, br, agentOpts)
 

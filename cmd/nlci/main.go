@@ -24,6 +24,7 @@ import (
 var (
 	flagDryRun  bool
 	flagExplain bool
+	flagYes     bool
 	flagBackend string
 	initSeedPartRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 )
@@ -56,6 +57,7 @@ Examples:
 
 	root.PersistentFlags().BoolVar(&flagDryRun, "dry-run", false, "Print the generated command without executing it")
 	root.PersistentFlags().BoolVar(&flagExplain, "explain", false, "Always print the command explanation")
+	root.PersistentFlags().BoolVarP(&flagYes, "yes", "y", false, "Skip the y/N prompt and run the command immediately")
 	root.PersistentFlags().StringVar(&flagBackend, "backend", "", "Force a specific backend (apple, ollama, llamacpp, lmstudio)")
 
 	root.AddCommand(
@@ -192,8 +194,9 @@ func runTool(ctx context.Context, toolName, intent string) error {
 	br := buildBackendRouter(cfg, flagBackend)
 
 	agentOpts := agent.Options{
-		DryRun:  flagDryRun,
-		Explain: flagExplain,
+		DryRun:      flagDryRun,
+		Explain:     flagExplain,
+		AutoConfirm: flagYes,
 	}
 
 	a := agent.New(def, br, agentOpts)

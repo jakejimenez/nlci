@@ -12,8 +12,9 @@ import (
 
 // Options controls execution behavior.
 type Options struct {
-	DryRun  bool
-	Explain bool // always print explanation even if not requiring confirmation
+	DryRun      bool
+	Explain     bool // always print explanation even if not requiring confirmation
+	AutoConfirm bool // skip the y/N prompt and run immediately
 }
 
 // ExecError carries details about a failed command execution.
@@ -83,19 +84,20 @@ func isUsageError(stderr string) bool {
 }
 
 // Execute runs the given command string as a subprocess.
-// It displays the command and explanation, optionally confirms, then runs.
-func Execute(ctx context.Context, command, explanation string, requiresConfirmation bool, opts Options) error {
-	// Always display the command
+// It displays the command and explanation, asks the user to confirm (unless
+// AutoConfirm is set), then runs. DryRun short-circuits before any prompt.
+func Execute(ctx context.Context, command, explanation string, opts Options) error {
+	// Always display the command.
 	Display(command, explanation)
 
-	// Dry-run: print and exit without executing
+	// Dry-run: print and exit without executing.
 	if opts.DryRun {
 		fmt.Println("\n  [dry-run: command not executed]")
 		return nil
 	}
 
-	// Confirmation required: ask the user
-	if requiresConfirmation {
+	// Default: prompt the user. --yes/-y opts out.
+	if !opts.AutoConfirm {
 		if !Confirm() {
 			fmt.Println("  Cancelled.")
 			return nil
