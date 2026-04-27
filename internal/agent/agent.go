@@ -31,9 +31,10 @@ type Agent struct {
 
 // Options configures the agent's execution behavior.
 type Options struct {
-	DryRun  bool
-	Explain bool
-	Backend string // force a specific backend name (empty = auto-detect)
+	DryRun      bool
+	Explain     bool
+	AutoConfirm bool   // skip the y/N prompt before exec
+	Backend     string // force a specific backend name (empty = auto-detect)
 }
 
 // Result is the outcome of a Run call.
@@ -68,17 +69,18 @@ func (a *Agent) Run(ctx context.Context, intent string) (*Result, error) {
 // On a CLI usage error it injects stderr into the next generation prompt.
 // On a misrouting error it also widens the retrieval candidate set.
 func (a *Agent) runExecLoop(ctx context.Context, intent string, candidates []retrieval.Candidate, errCtx string, execAttempt int) (*Result, error) {
-	result, v, err := a.runLoop(ctx, intent, candidates, errCtx, 0)
+	result, _, err := a.runLoop(ctx, intent, candidates, errCtx, 0)
 	if err != nil {
 		return nil, err
 	}
 
 	execOpts := executor.Options{
-		DryRun:  a.opts.DryRun,
-		Explain: a.opts.Explain,
+		DryRun:      a.opts.DryRun,
+		Explain:     a.opts.Explain,
+		AutoConfirm: a.opts.AutoConfirm,
 	}
 
-	if err := executor.Execute(ctx, result.Command, result.Explanation, v.RequiresConfirmation, execOpts); err != nil {
+	if err := executor.Execute(ctx, result.Command, result.Explanation, execOpts); err != nil {
 		var execErr *executor.ExecError
 		if execAttempt < maxExecRetries && errors.As(err, &execErr) && execErr.IsUsageError {
 			if execErr.IsMisrouting {
@@ -112,7 +114,7 @@ func (a *Agent) Generate(ctx context.Context, intent string) (*Result, error) {
 }
 
 // runLoop is the agentic retry loop for inference + validation.
-// Returns the Result, the validator.Result (for RequiresConfirmation), and any error.
+// Returns the Result, the validator.Result, and any error.
 func (a *Agent) runLoop(ctx context.Context, intent string, candidates []retrieval.Candidate, errorContext string, attempt int) (*Result, validator.Result, error) {
 	if attempt >= maxRetries {
 		return nil, validator.Result{}, fmt.Errorf("could not generate a valid command after %d attempts.\nTry rephrasing your intent", maxRetries)
