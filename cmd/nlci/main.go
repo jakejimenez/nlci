@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 	"github.com/jakejimenez/nlci/config"
 	"github.com/jakejimenez/nlci/internal/agent"
 	"github.com/jakejimenez/nlci/internal/backend"
@@ -330,7 +331,8 @@ func scaffoldDefinition(ctx context.Context, toolName string, opts scaffoldOptio
 		if flagResult, flagErr := definition.DiscoverFlagDriven(toolName); flagErr == nil && !flagResult.Weak {
 			enrichedFlagResult, synonyms := definition.EnrichFlagDrivenScaffold(toolName, flagResult)
 			mode = "flag_driven"
-			if err := writeFlagDrivenScaffold(filename, toolName, enrichedFlagResult, synonyms); err != nil {
+			llmMeta := runMetadataEnrichment(ctx, opts, toolName, "flag_driven", enrichedFlagResult.RootHelp, capabilitiesAsCommands(enrichedFlagResult.Capabilities), opts.Quiet)
+			if err := writeFlagDrivenScaffold(filename, toolName, enrichedFlagResult, synonyms, llmMeta); err != nil {
 				return "", err
 			}
 			if !opts.Quiet {
@@ -371,7 +373,9 @@ func scaffoldDefinition(ctx context.Context, toolName string, opts scaffoldOptio
 	enrichedCommands, generatedSynonyms := definition.EnrichCommandTreeScaffold(toolName, result.Commands)
 	result.Commands = enrichedCommands
 
-	if err := writeScaffold(filename, toolName, result.Commands, generatedSynonyms); err != nil {
+	llmMeta := runMetadataEnrichment(ctx, opts, toolName, "command_tree", result.RootHelp, result.Commands, opts.Quiet)
+
+	if err := writeScaffold(filename, toolName, result.Commands, generatedSynonyms, llmMeta); err != nil {
 		return "", err
 	}
 
@@ -436,37 +440,390 @@ func enrichInitDiscovery(ctx context.Context, br *backend.Router, toolName strin
 	return merged, len(merged.Commands) - before, nil
 }
 
-func buildInitInferencePrompt(toolName string, base *definition.DiscoveryResult) string {
+// runMetadataEnrichment is the §B call site shared by both command_tree and
+// flag_driven scaffolds. Best-effort: any failure (no router available, LLM
+// error, malformed YAML, timeout) returns nil so callers fall through to
+// hardcoded defaults rather than blocking the scaffold write.
+//
+// Apple Intelligence is skipped here: nlci-apple's Swift bridge constrains
+// output to a Generable CommandResult struct, so it can't return free-form
+// YAML. Run init under Ollama / llama.cpp / LM Studio to populate the
+// metadata fields. Hardcoded fallback applies otherwise.
+func runMetadataEnrichment(ctx context.Context, opts scaffoldOptions, toolName, mode, helpText string, commands []definition.Command, quiet bool) *EnrichmentMetadata {
+	br := opts.BackendRouter
+	if br == nil {
+		if cfg, cfgErr := config.Load(); cfgErr == nil {
+			br = buildBackendRouter(cfg, flagBackend)
+		}
+	}
+	if br == nil {
+		return nil
+	}
+
+	// Resolve so we know which backend will run, then skip Apple cleanly.
+	if _, err := br.Resolve(ctx); err != nil {
+		return nil
+	}
+	if br.ActiveName() == "apple" {
+		if !quiet {
+			fmt.Println("Metadata enrichment skipped: Apple backend constrains output to single commands. Use --backend ollama|llamacpp|lmstudio for richer metadata.")
+		}
+		return nil
+	}
+
+	enrichCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
+	if !quiet {
+		fmt.Println("Enriching scaffold metadata via inference…")
+	}
+
+	meta, err := enrichInitMetadata(enrichCtx, br, toolName, toolName, mode, helpText, commands)
+	if err != nil {
+		if !quiet {
+			fmt.Printf("Metadata enrichment skipped: %v\n", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "metadata enrichment skipped: %v\n", err)
+		}
+		return nil
+	}
+	return meta
+}
+
+// capabilitiesAsCommands adapts a flag-driven capability list into the
+// definition.Command shape used by the §B prompt. Only Name and Description
+// are needed — the prompt cares about the surface, not flag bindings.
+func capabilitiesAsCommands(caps []definition.Capability) []definition.Command {
+	out := make([]definition.Command, 0, len(caps))
+	for _, c := range caps {
+		out = append(out, definition.Command{Name: c.Name, Description: c.Description})
+	}
+	return out
+}
+
+// EnrichmentMetadata is the output of the §B enrichment call. Each field is
+// optional at the YAML level — if the LLM call fails or returns malformed
+// content, callers fall back to hardcoded defaults so the scaffold still
+// gets written.
+type EnrichmentMetadata struct {
+	Description  string              `yaml:"description"`
+	SystemPrompt string              `yaml:"system_prompt"`
+	Safety       definition.Safety   `yaml:"safety"`
+	Synonyms     map[string][]string `yaml:"synonyms"`
+}
+
+// enrichInitMetadata runs the §B prompt against the verified command tree and
+// returns parsed metadata. Returns nil on any failure — caller is expected to
+// fall back to hardcoded defaults rather than blocking the scaffold write.
+func enrichInitMetadata(ctx context.Context, br *backend.Router, toolName, binary, mode string, helpText string, commands []definition.Command) (*EnrichmentMetadata, error) {
+	if br == nil {
+		return nil, fmt.Errorf("enrichInitMetadata: nil backend router")
+	}
+	if mode == "" {
+		mode = "command_tree"
+	}
+
+	system := initEnrichmentSystemPrompt()
+	user := buildInitEnrichmentPrompt(toolName, binary, mode, helpText, commands)
+
+	resp, err := br.Generate(ctx, backend.Request{System: system, Intent: user})
+	if err != nil {
+		return nil, err
+	}
+	meta, err := parseEnrichmentYAML(resp.Command)
+	if err != nil {
+		return nil, err
+	}
+	return meta, nil
+}
+
+// initEnrichmentSystemPrompt is the static system prompt for §B. Two few-shot
+// examples (command_tree + flag_driven) are embedded so the model has both
+// shapes to generalize from. The "evidence first" rule grounds destructive
+// patterns in real help-text quotes.
+func initEnrichmentSystemPrompt() string {
+	return strings.TrimSpace(`<role>
+You are a CLI tool curator. You read a tool's help output and its verified command surface, and you produce a small block of metadata that an intent-translation layer will use: a one-line description, a tool-specific system prompt, safety patterns for destructive operations, and a synonym map for retrieval.
+
+Produce metadata that is grounded in what the help text actually says. If you cannot find evidence in the help, omit the field rather than guessing.
+</role>
+
+<output_format>
+Output exactly one YAML block wrapped in <yaml>...</yaml> tags. The YAML must contain these four top-level keys:
+
+- description: a single-line string, ≤80 chars, capturing the tool's purpose. Bad: "docker CLI". Good: "Manage Docker containers, images, networks, and volumes".
+- system_prompt: a multi-line string (4–7 lines) suitable to be used directly as the system prompt for an LLM that translates intent → exact commands. Must include: (1) the binary name and what kind of tool it is, (2) any tool-specific behavior or default to be aware of (derived from the help, not invented), (3) safety reminders for this tool. Avoid generic boilerplate.
+- safety:
+    require_confirmation: array of command-substring patterns matched at word boundaries by the executor. Look for verbs in the help text: delete/remove/rm/destroy/drop/purge/reset/force/prune/clean. Use full subcommand paths, e.g. "docker rm" not "rm". Empty array if the tool has no destructive operations.
+    forbidden: array of command-substring patterns the user should never run. Reserved for irreversible+sweeping operations. Usually empty.
+- synonyms: a map of natural-language word → array of command paths or capability names. 5–15 entries.
+
+Do not output any text outside the <yaml>...</yaml> tags except for an optional <evidence>...</evidence> block before it (which the parser will ignore — it exists only to ground your safety picks).
+</output_format>
+
+<rules>
+- Mode-aware: if the tool is command_tree, synonyms map to subcommand paths ("list" → ["ps"]). If flag_driven, synonyms map to capability names ("download" → ["transfer"]).
+- Use only information present in the help text or verified list. Never invent flags, subcommands, or behaviors.
+- Quote evidence: before producing the YAML, briefly identify in <evidence> tags which lines from the help text justify your destructive-pattern picks.
+</rules>
+
+<examples>
+<example>
+<input_summary>tool=docker, mode=command_tree, verbs include ps/run/stop/rm/rmi/exec/logs/build/pull/push/volume/system prune</input_summary>
+<output>
+<evidence>
+- "rm: Remove one or more containers" → destructive
+- "rmi: Remove one or more images" → destructive
+- "volume rm" → destructive (data loss)
+- "system prune" → destructive (sweeping cleanup)
+</evidence>
+<yaml>
+description: "Manage Docker containers, images, networks, and volumes"
+system_prompt: |
+  You are an expert Docker administrator. Translate intent into exact docker commands.
+  - Commands must start with "docker"
+  - Prefer "docker ps" over "docker container ls" for listing containers
+  - Default to no flags; only add --all/-a, --force/-f, or --volumes when the user explicitly asks
+  - For container exec, use -it only if the user mentions "interactive" or "shell"
+  - Output only the raw command, no markdown, no explanation
+safety:
+  require_confirmation:
+    - "docker rm"
+    - "docker rmi"
+    - "docker volume rm"
+    - "docker system prune"
+  forbidden:
+    - "docker system prune --all --volumes --force"
+synonyms:
+  list: ["ps"]
+  show: ["ps", "logs"]
+  delete: ["rm", "rmi"]
+  remove: ["rm", "rmi"]
+  shell: ["exec"]
+  logs: ["logs"]
+  build: ["build"]
+  cleanup: ["system prune"]
+  prune: ["system prune"]
+</yaml>
+</output>
+</example>
+
+<example>
+<input_summary>tool=curl, mode=flag_driven, capabilities include request/headers/auth/output/redirects/transfer/proxy/tls/debugging</input_summary>
+<output>
+<evidence>
+- curl is non-destructive in normal use; HTTP requests target user-supplied URLs.
+- No safety patterns warranted.
+</evidence>
+<yaml>
+description: "Transfer data from or to a server using HTTP, FTP, and other protocols"
+system_prompt: |
+  You are an expert curl user. Build commands from flags and a positional URL.
+  - Commands must start with "curl"
+  - Default to GET; only add --json, --data, or --form when the user clearly asks for a body
+  - Use exactly the URL the user provides; never substitute placeholder URLs
+  - Add -L only when the user explicitly mentions following redirects
+  - Add -k or --insecure only when the user explicitly mentions skipping TLS verification
+  - Output only the raw command, no markdown, no explanation
+safety:
+  require_confirmation: []
+  forbidden: []
+synonyms:
+  fetch: ["transfer"]
+  download: ["transfer", "output"]
+  get: ["transfer"]
+  post: ["request"]
+  upload: ["transfer"]
+  json: ["request"]
+  headers: ["headers"]
+  follow: ["redirects"]
+  insecure: ["tls"]
+  proxy: ["proxy"]
+  verbose: ["debugging"]
+</yaml>
+</output>
+</example>
+</examples>`)
+}
+
+// buildInitEnrichmentPrompt is the user prompt for §B. Long help text first,
+// verified command list second, then the request to produce metadata.
+func buildInitEnrichmentPrompt(toolName, binary, mode, helpText string, commands []definition.Command) string {
 	var b strings.Builder
-	b.WriteString("Root help summary:\n")
-	b.WriteString(base.RootHelp)
-	b.WriteString("\n\nAlready verified commands:\n")
-	if len(base.Commands) == 0 {
-		b.WriteString("  (none)\n")
+	b.WriteString("<tool>\n")
+	b.WriteString(fmt.Sprintf("<name>%s</name>\n", toolName))
+	if binary == "" {
+		binary = toolName
+	}
+	b.WriteString(fmt.Sprintf("<binary>%s</binary>\n", binary))
+	b.WriteString(fmt.Sprintf("<mode>%s</mode>\n", mode))
+	b.WriteString("<root_help>\n")
+	b.WriteString(trimHelp(helpText, 2048))
+	b.WriteString("\n</root_help>\n")
+	b.WriteString("<verified_commands>\n")
+	if len(commands) == 0 {
+		b.WriteString("(none)\n")
 	} else {
-		for _, c := range base.Commands {
+		for _, c := range commands {
 			if c.Description != "" {
-				b.WriteString(fmt.Sprintf("  %s: %s\n", c.Name, c.Description))
+				b.WriteString(fmt.Sprintf("%s: %s\n", c.Name, c.Description))
 			} else {
-				b.WriteString(fmt.Sprintf("  %s\n", c.Name))
+				b.WriteString(fmt.Sprintf("%s\n", c.Name))
 			}
 		}
 	}
-	b.WriteString("\nReturn the most likely real command paths for ")
-	b.WriteString(toolName)
-	b.WriteString(" that should be probed next. One path per line, lowercase, no explanations.")
+	b.WriteString("</verified_commands>\n")
+	b.WriteString("</tool>\n\n")
+	b.WriteString("Now produce metadata for the tool above.\n")
+	return b.String()
+}
+
+// yamlBlockRe extracts a YAML block wrapped in <yaml>...</yaml> tags from raw
+// model output. Matched non-greedily across newlines so a stray `<yaml>` later
+// in the text doesn't swallow the closing tag.
+var yamlBlockRe = regexp.MustCompile(`(?s)<yaml>(.*?)</yaml>`)
+
+// parseEnrichmentYAML extracts the YAML block from §B output and parses it
+// into an EnrichmentMetadata. Returns an error if the tag is missing, the
+// YAML is malformed, or required fields are absent.
+func parseEnrichmentYAML(raw string) (*EnrichmentMetadata, error) {
+	m := yamlBlockRe.FindStringSubmatch(raw)
+	if len(m) < 2 {
+		return nil, fmt.Errorf("enrichment: no <yaml>...</yaml> block in model output")
+	}
+	body := strings.TrimSpace(m[1])
+	if body == "" {
+		return nil, fmt.Errorf("enrichment: empty YAML block")
+	}
+
+	var meta EnrichmentMetadata
+	if err := yaml.Unmarshal([]byte(body), &meta); err != nil {
+		return nil, fmt.Errorf("enrichment: yaml parse: %w", err)
+	}
+
+	// Reject placeholder leakage — if the model copied "<your-tool>" or
+	// similar bracketed tokens into the description or system_prompt, the
+	// validator would reject downstream commands anyway. Better to drop here
+	// and fall back to hardcoded.
+	if containsBracketedToken(meta.Description) || containsBracketedToken(meta.SystemPrompt) {
+		return nil, fmt.Errorf("enrichment: output contains placeholder tokens; using hardcoded fallback")
+	}
+
+	return &meta, nil
+}
+
+func containsBracketedToken(s string) bool {
+	return regexp.MustCompile(`<[a-zA-Z][^>]*>`).MatchString(s)
+}
+
+// mergeSynonyms unions LLM-produced synonyms with the heuristic ones. LLM
+// entries take precedence when keys conflict; heuristic targets get appended
+// when they bring new mappings the LLM didn't generate.
+func mergeSynonyms(heuristic, llm map[string][]string) map[string][]string {
+	if len(llm) == 0 {
+		return heuristic
+	}
+	merged := make(map[string][]string, len(heuristic)+len(llm))
+	for k, v := range heuristic {
+		merged[k] = append([]string(nil), v...)
+	}
+	for k, v := range llm {
+		if existing, ok := merged[k]; ok {
+			seen := make(map[string]bool, len(existing))
+			for _, t := range existing {
+				seen[t] = true
+			}
+			for _, t := range v {
+				if !seen[t] {
+					existing = append(existing, t)
+					seen[t] = true
+				}
+			}
+			merged[k] = existing
+		} else {
+			merged[k] = append([]string(nil), v...)
+		}
+	}
+	return merged
+}
+
+// buildInitInferencePrompt assembles the user prompt for §A — the discovery
+// call. Long input (root_help) goes at the top, structured with XML tags, with
+// a single concrete few-shot example so the model has a clear output shape.
+// See plan §A for the rationale (Anthropic prompting guide: long-context
+// placement + XML tags + positive examples).
+func buildInitInferencePrompt(toolName string, base *definition.DiscoveryResult) string {
+	var b strings.Builder
+	b.WriteString("<tool>\n")
+	b.WriteString(fmt.Sprintf("<name>%s</name>\n", toolName))
+	b.WriteString("<root_help>\n")
+	b.WriteString(trimHelp(base.RootHelp, 2048))
+	b.WriteString("\n</root_help>\n")
+	b.WriteString("<verified>\n")
+	if len(base.Commands) == 0 {
+		b.WriteString("(none)\n")
+	} else {
+		for _, c := range base.Commands {
+			if c.Description != "" {
+				b.WriteString(fmt.Sprintf("%s: %s\n", c.Name, c.Description))
+			} else {
+				b.WriteString(fmt.Sprintf("%s\n", c.Name))
+			}
+		}
+	}
+	b.WriteString("</verified>\n")
+	b.WriteString("</tool>\n\n")
+	b.WriteString("<examples>\n")
+	b.WriteString("<example>\n")
+	b.WriteString("<verified>config get, env switch, query export</verified>\n")
+	b.WriteString("<output>\n")
+	b.WriteString("config set\n")
+	b.WriteString("config unset\n")
+	b.WriteString("config list\n")
+	b.WriteString("env list\n")
+	b.WriteString("env create\n")
+	b.WriteString("env delete\n")
+	b.WriteString("query get\n")
+	b.WriteString("query search\n")
+	b.WriteString("query schema\n")
+	b.WriteString("update\n")
+	b.WriteString("</output>\n")
+	b.WriteString("</example>\n")
+	b.WriteString("</examples>\n\n")
+	b.WriteString("Suggest additional command paths now.\n")
 	return b.String()
 }
 
 func initInferenceSystemPrompt(toolName string) string {
-	return strings.TrimSpace(fmt.Sprintf(`You are helping discover the command surface of the %s CLI.
-Return ONLY newline-separated command paths to probe next.
-Rules:
-- Output raw command paths only, one per line
-- Do not include the binary name %q
-- Prefer common real subcommands and nested paths
-- Never invent placeholders, examples, or explanations
-- Suggest at most 20 paths`, toolName, toolName))
+	return strings.TrimSpace(fmt.Sprintf(`<role>
+You are a CLI tool researcher. Given a tool's --help output and a list of subcommands already verified by deterministic --help parsing, suggest more command paths likely to exist. A separate verification step runs %q with each suggestion to confirm the path is real, so prefer breadth: an extra suggestion that turns out to be invalid is dropped silently, but a missed real subcommand is permanently absent from the scaffold.
+</role>
+
+<output_format>
+- One command path per line, lowercase, space-separated for nested paths (e.g., "config set").
+- Up to 20 paths.
+- No commentary, no markdown, no explanations — only the paths.
+</output_format>
+
+<rules>
+- Do not repeat any path already in <verified>.
+- Do not include the binary name %q as a prefix.
+- Look for: subcommands mentioned in the help text but not yet verified;
+  common nested patterns (e.g., if "config" is verified, try
+  "config set/unset/list"); conventional verbs typical of the tool's domain.
+- If the tool appears flag-driven (no subcommand list in help), output nothing.
+</rules>`, toolName+" --help", toolName))
+}
+
+// trimHelp limits a help-text payload to maxBytes. We keep the top of the
+// text since command listings typically appear early; the bottom usually
+// contains usage syntax and option descriptions which the discovery prompt
+// doesn't need.
+func trimHelp(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	return s[:maxBytes] + "\n... [truncated]"
 }
 
 func parseInitSeedList(raw string) []string {
@@ -526,20 +883,32 @@ func definitionCommandsMerge(base, additions []definition.Command) []definition.
 	return result
 }
 
-func writeScaffold(filename, toolName string, commands []definition.Command, synonyms map[string][]string) error {
+func writeScaffold(filename, toolName string, commands []definition.Command, synonyms map[string][]string, meta *EnrichmentMetadata) error {
 	f, err := os.Create(filename)
 	if err != nil {
 		return fmt.Errorf("init: create %s: %w", filename, err)
 	}
 	defer f.Close()
 
+	description := fmt.Sprintf("%s CLI", toolName)
+	systemPrompt := fmt.Sprintf("You are an expert %s user. Generate precise %s commands.\nOutput only the raw command — no markdown, no explanation.\n", toolName, toolName)
+	if meta != nil {
+		if meta.Description != "" {
+			description = meta.Description
+		}
+		if meta.SystemPrompt != "" {
+			systemPrompt = strings.TrimRight(meta.SystemPrompt, "\n") + "\n"
+		}
+	}
+
 	fmt.Fprintf(f, "name: %s\n", toolName)
-	fmt.Fprintf(f, "description: %s CLI\n", toolName)
+	fmt.Fprintf(f, "description: %s\n", yamlQuote(description))
 	fmt.Fprintf(f, "binary: %s\n", toolName)
 	fmt.Fprintf(f, "mode: command_tree\n")
 	fmt.Fprintf(f, "\nsystem_prompt: |\n")
-	fmt.Fprintf(f, "  You are an expert %s user. Generate precise %s commands.\n", toolName, toolName)
-	fmt.Fprintf(f, "  Output only the raw command — no markdown, no explanation.\n")
+	for _, line := range strings.Split(strings.TrimRight(systemPrompt, "\n"), "\n") {
+		fmt.Fprintf(f, "  %s\n", line)
+	}
 	fmt.Fprintf(f, "\ncommands:\n")
 
 	for _, c := range commands {
@@ -552,9 +921,11 @@ func writeScaffold(filename, toolName string, commands []definition.Command, syn
 		fmt.Fprintln(f)
 	}
 
-	fmt.Fprintf(f, "safety:\n")
-	fmt.Fprintf(f, "  require_confirmation: []\n")
-	fmt.Fprintf(f, "  forbidden: []\n")
+	writeSafety(f, meta)
+
+	if meta != nil && len(meta.Synonyms) > 0 {
+		synonyms = mergeSynonyms(synonyms, meta.Synonyms)
+	}
 	if len(synonyms) > 0 {
 		writeSynonyms(f, synonyms)
 	}
@@ -564,21 +935,55 @@ func writeScaffold(filename, toolName string, commands []definition.Command, syn
 	return nil
 }
 
-func writeFlagDrivenScaffold(filename, toolName string, result *definition.FlagDiscoveryResult, synonyms map[string][]string) error {
+// writeSafety renders the safety block. Uses LLM-produced patterns when
+// available; falls back to empty arrays when meta is nil or its safety lists
+// are empty.
+func writeSafety(f *os.File, meta *EnrichmentMetadata) {
+	fmt.Fprintf(f, "safety:\n")
+	if meta != nil && len(meta.Safety.RequireConfirmation) > 0 {
+		fmt.Fprintf(f, "  require_confirmation:\n")
+		for _, p := range meta.Safety.RequireConfirmation {
+			fmt.Fprintf(f, "    - %s\n", yamlQuote(p))
+		}
+	} else {
+		fmt.Fprintf(f, "  require_confirmation: []\n")
+	}
+	if meta != nil && len(meta.Safety.Forbidden) > 0 {
+		fmt.Fprintf(f, "  forbidden:\n")
+		for _, p := range meta.Safety.Forbidden {
+			fmt.Fprintf(f, "    - %s\n", yamlQuote(p))
+		}
+	} else {
+		fmt.Fprintf(f, "  forbidden: []\n")
+	}
+}
+
+func writeFlagDrivenScaffold(filename, toolName string, result *definition.FlagDiscoveryResult, synonyms map[string][]string, meta *EnrichmentMetadata) error {
 	f, err := os.Create(filename)
 	if err != nil {
 		return fmt.Errorf("init: create %s: %w", filename, err)
 	}
 	defer f.Close()
 
+	description := fmt.Sprintf("%s CLI", toolName)
+	systemPrompt := fmt.Sprintf("You are an expert %s user. Generate precise %s commands.\nThis tool is flag-driven: build commands from flags and positional arguments, not subcommands.\nOutput only the raw command — no markdown, no explanation.\n", toolName, toolName)
+	if meta != nil {
+		if meta.Description != "" {
+			description = meta.Description
+		}
+		if meta.SystemPrompt != "" {
+			systemPrompt = strings.TrimRight(meta.SystemPrompt, "\n") + "\n"
+		}
+	}
+
 	fmt.Fprintf(f, "name: %s\n", toolName)
-	fmt.Fprintf(f, "description: %s CLI\n", toolName)
+	fmt.Fprintf(f, "description: %s\n", yamlQuote(description))
 	fmt.Fprintf(f, "binary: %s\n", toolName)
 	fmt.Fprintf(f, "mode: flag_driven\n")
 	fmt.Fprintf(f, "\nsystem_prompt: |\n")
-	fmt.Fprintf(f, "  You are an expert %s user. Generate precise %s commands.\n", toolName, toolName)
-	fmt.Fprintf(f, "  This tool is flag-driven: build commands from flags and positional arguments, not subcommands.\n")
-	fmt.Fprintf(f, "  Output only the raw command — no markdown, no explanation.\n")
+	for _, line := range strings.Split(strings.TrimRight(systemPrompt, "\n"), "\n") {
+		fmt.Fprintf(f, "  %s\n", line)
+	}
 
 	fmt.Fprintf(f, "\nroot_flags:\n")
 	for _, flag := range result.RootFlags {
@@ -610,9 +1015,11 @@ func writeFlagDrivenScaffold(filename, toolName string, result *definition.FlagD
 		writeExamples(f, "      ", cap.Examples, fmt.Sprintf("%s ...", toolName))
 	}
 
-	fmt.Fprintf(f, "\nsafety:\n")
-	fmt.Fprintf(f, "  require_confirmation: []\n")
-	fmt.Fprintf(f, "  forbidden: []\n")
+	fmt.Fprintln(f)
+	writeSafety(f, meta)
+	if meta != nil && len(meta.Synonyms) > 0 {
+		synonyms = mergeSynonyms(synonyms, meta.Synonyms)
+	}
 	if len(synonyms) > 0 {
 		writeSynonyms(f, synonyms)
 	}
