@@ -441,14 +441,12 @@ func enrichInitDiscovery(ctx context.Context, br *backend.Router, toolName strin
 }
 
 // runMetadataEnrichment is the §B call site shared by both command_tree and
-// flag_driven scaffolds. Best-effort: any failure (no router available, LLM
-// error, malformed YAML, timeout) returns nil so callers fall through to
-// hardcoded defaults rather than blocking the scaffold write.
-//
-// Apple Intelligence is skipped here: nlci-apple's Swift bridge constrains
-// output to a Generable CommandResult struct, so it can't return free-form
-// YAML. Run init under Ollama / llama.cpp / LM Studio to populate the
-// metadata fields. Hardcoded fallback applies otherwise.
+// flag_driven scaffolds. It prefers a backend's native MetadataGenerator
+// capability (Apple Intelligence's @Generable schemas) when available and
+// falls back to the textual YAML prompt path on backends that don't
+// implement it (Ollama / llama.cpp / LM Studio). Best-effort throughout:
+// any failure returns nil so the caller falls through to hardcoded defaults
+// rather than blocking the scaffold write.
 func runMetadataEnrichment(ctx context.Context, opts scaffoldOptions, toolName, mode, helpText string, commands []definition.Command, quiet bool) *EnrichmentMetadata {
 	br := opts.BackendRouter
 	if br == nil {
@@ -460,24 +458,37 @@ func runMetadataEnrichment(ctx context.Context, opts scaffoldOptions, toolName, 
 		return nil
 	}
 
-	// Resolve so we know which backend will run, then skip Apple cleanly.
-	if _, err := br.Resolve(ctx); err != nil {
-		return nil
-	}
-	if br.ActiveName() == "apple" {
-		if !quiet {
-			fmt.Println("Metadata enrichment skipped: Apple backend constrains output to single commands. Use --backend ollama|llamacpp|lmstudio for richer metadata.")
-		}
+	active, err := br.Resolve(ctx)
+	if err != nil {
 		return nil
 	}
 
-	enrichCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	enrichCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
+	// Native structured generation: Apple advertises this via @Generable.
+	if mg, ok := active.(backend.MetadataGenerator); ok {
+		if !quiet {
+			fmt.Println("Enriching scaffold metadata via native structured generation…")
+		}
+		result, err := mg.GenerateMetadata(enrichCtx, backend.MetadataRequest{
+			System: initEnrichmentSystemPrompt(),
+			Prompt: buildInitEnrichmentPrompt(toolName, toolName, mode, helpText, commands),
+		})
+		if err == nil && result != nil {
+			return convertNativeMetadata(result)
+		}
+		if !quiet {
+			fmt.Printf("Native metadata enrichment failed, falling back to text prompt: %v\n", err)
+		}
+		// Fall through to text-prompt path below.
+	}
+
+	// Text-prompt path: ask for a YAML block in the model's command field
+	// and parse it. Used by backends that don't expose structured output.
 	if !quiet {
 		fmt.Println("Enriching scaffold metadata via inference…")
 	}
-
 	meta, err := enrichInitMetadata(enrichCtx, br, toolName, toolName, mode, helpText, commands)
 	if err != nil {
 		if !quiet {
@@ -488,6 +499,29 @@ func runMetadataEnrichment(ctx context.Context, opts scaffoldOptions, toolName, 
 		return nil
 	}
 	return meta
+}
+
+// convertNativeMetadata maps a backend.MetadataResult (returned by the
+// Apple bridge's @Generable structs) into the cmd-local EnrichmentMetadata
+// shape used by the scaffold writers. Applies the same placeholder-leak
+// guard the YAML parser uses, so a hallucinated "<your-tool>" in the
+// description trips the same fallback.
+func convertNativeMetadata(r *backend.MetadataResult) *EnrichmentMetadata {
+	if r == nil {
+		return nil
+	}
+	if containsBracketedToken(r.Description) || containsBracketedToken(r.SystemPrompt) {
+		return nil
+	}
+	return &EnrichmentMetadata{
+		Description:  r.Description,
+		SystemPrompt: r.SystemPrompt,
+		Safety: definition.Safety{
+			RequireConfirmation: r.Safety.RequireConfirmation,
+			Forbidden:           r.Safety.Forbidden,
+		},
+		Synonyms: r.Synonyms,
+	}
 }
 
 // capabilitiesAsCommands adapts a flag-driven capability list into the

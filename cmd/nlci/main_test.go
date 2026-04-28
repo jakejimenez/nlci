@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jakejimenez/nlci/internal/backend"
 	"github.com/jakejimenez/nlci/internal/definition"
 )
 
@@ -153,5 +154,46 @@ func TestMergeSynonyms_NilLLM(t *testing.T) {
 	merged := mergeSynonyms(heur, nil)
 	if len(merged) != 1 || merged["list"][0] != "ps" {
 		t.Fatalf("nil llm should pass heuristic through unchanged: %+v", merged)
+	}
+}
+
+func TestConvertNativeMetadata_HappyPath(t *testing.T) {
+	r := &backend.MetadataResult{
+		Description:  "Manage Docker things",
+		SystemPrompt: "You are a docker expert.",
+		Safety: backend.Safety{
+			RequireConfirmation: []string{"docker rm"},
+			Forbidden:           []string{},
+		},
+		Synonyms: map[string][]string{"list": {"ps"}},
+	}
+	got := convertNativeMetadata(r)
+	if got == nil {
+		t.Fatalf("expected conversion, got nil")
+	}
+	if got.Description != "Manage Docker things" {
+		t.Fatalf("description: got %q", got.Description)
+	}
+	if len(got.Safety.RequireConfirmation) != 1 || got.Safety.RequireConfirmation[0] != "docker rm" {
+		t.Fatalf("safety: got %+v", got.Safety)
+	}
+	if got.Synonyms["list"][0] != "ps" {
+		t.Fatalf("synonyms: got %+v", got.Synonyms)
+	}
+}
+
+func TestConvertNativeMetadata_RejectsPlaceholderInDescription(t *testing.T) {
+	r := &backend.MetadataResult{
+		Description:  "<your-tool> CLI",
+		SystemPrompt: "Generic.",
+	}
+	if got := convertNativeMetadata(r); got != nil {
+		t.Fatalf("expected nil for placeholder in description, got %+v", got)
+	}
+}
+
+func TestConvertNativeMetadata_NilInput(t *testing.T) {
+	if got := convertNativeMetadata(nil); got != nil {
+		t.Fatalf("expected nil for nil input, got %+v", got)
 	}
 }
