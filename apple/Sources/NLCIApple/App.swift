@@ -38,13 +38,15 @@ func buildPrompt(_ input: BridgeInput) -> String {
 struct NLCIApple {
     static func main() {
         Task {
-            // --ping mode: check availability and exit
+            // --ping mode: check availability and advertise capabilities so
+            // Go callers can gate metadata-mode requests on what this binary
+            // actually supports.
             if CommandLine.arguments.contains("--ping") {
                 if let errStr = checkAvailability() {
                     emit(BridgeOutput(error: errStr))
                     exit(1)
                 }
-                emit(BridgeOutput(command: "ok", explanation: "Apple Intelligence is available"))
+                emit(BridgeOutput(capabilities: ["command", "metadata"]))
                 exit(0)
             }
 
@@ -70,19 +72,28 @@ struct NLCIApple {
                 exit(1)
             }
 
-            // Run inference
+            // Run inference. The mode field selects which @Generable schema
+            // the model is constrained to produce.
             do {
                 let session = LanguageModelSession(instructions: input.system)
 
-                let response = try await session.respond(
-                    to: buildPrompt(input),
-                    generating: CommandResult.self
-                )
-
-                emit(BridgeOutput(
-                    command: response.content.command,
-                    explanation: response.content.explanation
-                ))
+                switch input.mode {
+                case "metadata":
+                    let response = try await session.respond(
+                        to: buildPrompt(input),
+                        generating: ToolMetadata.self
+                    )
+                    emit(BridgeOutput(metadata: response.content))
+                default: // "command"
+                    let response = try await session.respond(
+                        to: buildPrompt(input),
+                        generating: CommandResult.self
+                    )
+                    emit(BridgeOutput(
+                        command: response.content.command,
+                        explanation: response.content.explanation
+                    ))
+                }
                 exit(0)
             } catch {
                 emit(BridgeOutput(error: "inference:\(error.localizedDescription)"))
